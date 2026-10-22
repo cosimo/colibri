@@ -9,6 +9,8 @@
 mod flow;
 #[allow(dead_code)]
 mod session;
+#[allow(dead_code)]
+mod worker;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
