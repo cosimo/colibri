@@ -31,7 +31,8 @@ const PATCH_SIZE: f64 = 0.5;
 /// Measuring screen show its progress, about a second in all.
 const SIMULATED_READING_TIME: Duration = Duration::from_millis(25);
 
-const START_PROMPT: &str = "Put the sensor on the square and press Space";
+/// What the patch window says while it waits for Space.
+pub const START_PROMPT: &str = "Put the sensor on the square and press Space";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensorChoice {
@@ -43,12 +44,15 @@ pub enum SensorChoice {
 pub enum WorkerMsg {
     /// The patch window is up, waiting for Space.
     WaitingForStart,
+    /// The first reading is under way.
+    Started,
     Progress {
         done: usize,
         total: usize,
     },
-    /// The last message of every run.
-    Finished(Result<Calibration, String>),
+    /// The last message of every run. The calibration is boxed, it is much
+    /// bigger than the other messages.
+    Finished(Result<Box<Calibration>, String>),
 }
 
 /// D65 white and the sRGB tone curve, the only target for now.
@@ -143,7 +147,7 @@ pub fn spawn_calibration(
             SensorChoice::Simulated => run_simulated(cancel, messenger.clone()),
             SensorChoice::Spotread => run_spotread(monitor, cancel, messenger.clone()),
         };
-        messenger.send(WorkerMsg::Finished(result));
+        messenger.send(WorkerMsg::Finished(result.map(Box::new)));
     })
 }
 
@@ -153,6 +157,7 @@ fn run_simulated(cancel: Arc<AtomicBool>, messenger: Messenger) -> Result<Calibr
     let options = Options::default();
     let total = measurement_count(&options);
     let sim = SimRig::new(SimDisplay::wide_gamut(), SimSensor::colorimeter(1));
+    messenger.send(WorkerMsg::Started);
     let on_progress = move |done, total| {
         std::thread::sleep(SIMULATED_READING_TIME);
         messenger.send(WorkerMsg::Progress { done, total });
@@ -185,6 +190,7 @@ fn run_spotread(
     let total = measurement_count(&options);
     let status = window.status_line();
     status.set(&progress_text(0, total, Duration::ZERO));
+    messenger.send(WorkerMsg::Started);
     let started = Instant::now();
     let on_progress = move |done, total| {
         status.set(&progress_text(done, total, started.elapsed()));
@@ -265,5 +271,16 @@ mod tests {
             matches!(&last, Some(WorkerMsg::Finished(Err(e))) if e.contains("display")),
             "{last:?}"
         );
+    }
+
+    #[test]
+    fn simulated_run_says_when_measuring_starts() {
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        spawn_calibration(SensorChoice::Simulated, None, cancel, tx, Box::new(|| {}))
+            .join()
+            .unwrap();
+        let first = rx.try_iter().next();
+        assert!(matches!(first, Some(WorkerMsg::Started)), "{first:?}");
     }
 }

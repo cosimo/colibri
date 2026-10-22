@@ -4,22 +4,24 @@
 // Release builds on Windows use the GUI subsystem, so no console opens.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-// The screens that use it come later.
-#[allow(dead_code)]
+mod app;
 mod flow;
-#[allow(dead_code)]
 mod session;
-#[allow(dead_code)]
 mod worker;
 
+use eframe::egui;
+
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions::default();
-    eframe::run_native("colibri", options, Box::new(|_cc| Ok(Box::new(Empty))))
-}
-
-/// An empty window, until the screens are there.
-struct Empty;
-
-impl eframe::App for Empty {
-    fn ui(&mut self, _ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {}
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([600.0, 520.0])
+        .with_min_inner_size([440.0, 380.0]);
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "colibri",
+        options,
+        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+    )
 }

@@ -4,9 +4,24 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use colibri_windows::Monitor;
+use colibri_windows::{ColorMode, Monitor};
 
 const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Where the Windows display settings are, for the messages that ask to
+/// change them.
+const DISPLAY_SETTINGS: &str = "Settings > System > Display";
+
+/// The search for the Spyder4 in `spotread -?`, which runs while the Ready
+/// screen is up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpyderSearch {
+    Looking,
+    /// The port name spotread gives it.
+    Found(String),
+    /// Why it wasn't found.
+    Missing(String),
+}
 
 /// Whether the Ready screen offers a choice of display. With one display
 /// there is nothing to choose.
@@ -17,6 +32,36 @@ pub fn show_display_choice(monitors: &[Monitor]) -> bool {
 /// Position of the primary display in `monitors`, or else the first.
 pub fn default_monitor(monitors: &[Monitor]) -> usize {
     monitors.iter().position(|m| m.primary).unwrap_or(0)
+}
+
+/// Why Calibrate with the Spyder4 is disabled, or `None` when it can run.
+/// Measuring needs the Spyder4, a display for the patches, and that display
+/// in plain SDR. `color_mode` is `None` when Windows couldn't say.
+pub fn spotread_blocker(
+    spyder: &SpyderSearch,
+    monitor: Option<&Monitor>,
+    color_mode: Option<ColorMode>,
+) -> Option<String> {
+    match spyder {
+        SpyderSearch::Looking => return Some("Still looking for the Spyder4".into()),
+        SpyderSearch::Missing(why) => return Some(why.clone()),
+        SpyderSearch::Found(_) => {}
+    }
+    let Some(monitor) = monitor else {
+        return Some("No display found to show the patches on".into());
+    };
+
+    // Windows would transform the patches on their way to the panel.
+    let name = &monitor.name;
+    match color_mode {
+        Some(ColorMode::AutoColorManagement) => Some(format!(
+            "Turn off Auto Color Management for {name} in {DISPLAY_SETTINGS} first"
+        )),
+        Some(ColorMode::Hdr) => Some(format!(
+            "Turn off HDR for {name} in {DISPLAY_SETTINGS} first"
+        )),
+        _ => None,
+    }
 }
 
 /// How a display shows in the dropdown, such as
@@ -143,7 +188,7 @@ mod tests {
     fn display_choice_only_with_several_displays() {
         let asus = monitor(0, "ASUS PA328CGV", true);
         let dell = monitor(1, "DELL U2720Q", false);
-        assert!(!show_display_choice(&[asus.clone()]));
+        assert!(!show_display_choice(std::slice::from_ref(&asus)));
         assert!(show_display_choice(&[asus, dell]));
     }
 
@@ -212,5 +257,53 @@ mod tests {
         assert_eq!(utc_from_unix(0), [1970, 1, 1, 0, 0, 0]);
         assert_eq!(utc_from_unix(951_782_400), [2000, 2, 29, 0, 0, 0]);
         assert_eq!(utc_from_unix(1_792_701_171), [2026, 10, 22, 20, 32, 51]);
+    }
+
+    #[test]
+    fn spotread_needs_the_spyder() {
+        let asus = monitor(0, "ASUS PA328CGV", true);
+        let looking = spotread_blocker(&SpyderSearch::Looking, Some(&asus), Some(ColorMode::Sdr));
+        assert!(
+            looking.is_some(),
+            "calibrate allowed before the Spyder4 was found"
+        );
+
+        let missing = SpyderSearch::Missing("spotread lists no Spyder".into());
+        let blocker = spotread_blocker(&missing, Some(&asus), Some(ColorMode::Sdr));
+        assert_eq!(blocker.as_deref(), Some("spotread lists no Spyder"));
+    }
+
+    #[test]
+    fn spotread_needs_a_display() {
+        let found = SpyderSearch::Found("usb:/bus0/dev1/ (Datacolor Spyder4)".into());
+        assert!(spotread_blocker(&found, None, None).is_some());
+    }
+
+    #[test]
+    fn spotread_refuses_colour_managed_displays() {
+        let asus = monitor(0, "ASUS PA328CGV", true);
+        let found = SpyderSearch::Found("usb:/bus0/dev1/ (Datacolor Spyder4)".into());
+
+        let acm = spotread_blocker(&found, Some(&asus), Some(ColorMode::AutoColorManagement));
+        let acm = acm.unwrap_or_default();
+        assert!(acm.contains("Auto Color Management"), "{acm}");
+        assert!(acm.contains("ASUS PA328CGV"), "{acm}");
+
+        let hdr = spotread_blocker(&found, Some(&asus), Some(ColorMode::Hdr)).unwrap_or_default();
+        assert!(hdr.contains("HDR"), "{hdr}");
+        assert!(hdr.contains("ASUS PA328CGV"), "{hdr}");
+    }
+
+    #[test]
+    fn spotread_runs_in_sdr_or_an_unknown_mode() {
+        let asus = monitor(0, "ASUS PA328CGV", true);
+        let found = SpyderSearch::Found("usb:/bus0/dev1/ (Datacolor Spyder4)".into());
+        for mode in [Some(ColorMode::Sdr), Some(ColorMode::Unknown), None] {
+            assert_eq!(
+                spotread_blocker(&found, Some(&asus), mode),
+                None,
+                "{mode:?}"
+            );
+        }
     }
 }
