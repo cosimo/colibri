@@ -17,16 +17,22 @@ cargo run -p colibri-sim --example compare_sensors
 
 | Crate | What it holds |
 |---|---|
-| `colibri-core` | Colorimetry (XYZ, Lab, ΔE2000, Bradford, RGB matrices), tone curves, the `Rig` instrument trait and the calibration algorithm. No dependencies. |
-| `colibri-sim` | Spectral display model and simulated colorimeter, aged colorimeter and RAW phone camera, plus a ground-truth checker. |
+| `colibri-core` | Colorimetry (XYZ, Lab, ΔE2000, Bradford, RGB matrices), noise-aware tone curve fitting, the `Rig` instrument trait, calibration with optional closed-loop refinement, and an ICC v4 profile writer with `vcgt` and Microsoft's `MHC2` tag. No dependencies. |
+| `colibri-sim` | Spectral display model (with ripple and channel interaction) and simulated colorimeter, aged colorimeter and RAW phone camera, an emulation of Windows' MHC2 pipeline, and a ground-truth checker. |
 
 Things the simulator has shown so far:
 
 - Without noise, the calibration algorithm is exact (ΔE2000 under 0.02) with
   every sensor type, including a phone camera with an unknown colour space.
 - Instrument noise is the main remaining error, and inverting the channel
-  matrix amplifies it, more so on panels with overlapping primaries. Averaging
-  repeated readings per patch (`Options::repeats`) reduces it.
+  matrix amplifies it, more so on panels with overlapping primaries. Smoothing
+  the measured curves, with each point weighted by the instrument's measured
+  noise and the strength picked by cross-validation, matches doubling every
+  reading for 8 extra patches, and does not erase real ripples in a panel's
+  response. Averaging repeated readings (`Options::repeats`) helps further.
+- Panels whose channels interact (power limiting, crosstalk) defeat open-loop
+  calibration. `Characterization::additivity_error` detects it, and two
+  refinement passes take a 20% interaction from ΔE 1.07 to 0.11.
 - Rounding the calibration to 8 bits on its own costs about 1.1 ΔE2000 in the
   shadows, against 0.22 at 10 bits. This is a point in favour of Windows'
   high-precision MHC2 pipeline.
@@ -181,9 +187,11 @@ in CI without any hardware.
 
 ## Roadmap
 
-1. **core + simulated instrument**: colour maths, calibration curves and
-   simulator are done. Next: noise-robust curve fitting, closed-loop
-   refinement passes, and the ICC/MHC2 profile writer.
+1. **core + simulated instrument**: done. Colour maths, calibration,
+   simulator and ICC/MHC2 writer. Through the emulated Windows pipeline, an
+   MHC2 profile makes a simulated wide-gamut panel show sRGB colours within
+   ΔE 1. The MHC2 layout follows MHC2Gen's reverse engineering; it still has
+   to be checked against Microsoft's documentation and on real Windows 11.
 2. **Argyll instrument layer over FFI**: real sensors, patch window, MHC2
    profile install on Windows 11.
 3. **Phone camera mode**: gamma, gray balance and uniformity; EDID prior for

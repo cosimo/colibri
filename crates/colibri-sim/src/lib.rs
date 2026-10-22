@@ -4,6 +4,7 @@
 pub mod display;
 pub mod rng;
 pub mod sensor;
+pub mod windows;
 
 use colibri_core::color::{delta_e_2000, Xyz};
 use colibri_core::curve::TargetCurve;

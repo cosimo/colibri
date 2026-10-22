@@ -4,6 +4,8 @@
 pub mod calibrate;
 pub mod color;
 pub mod curve;
+pub mod icc;
 pub mod math;
+mod md5;
 pub mod rig;
 pub mod spectral;
