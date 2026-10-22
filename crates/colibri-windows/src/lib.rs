@@ -14,7 +14,7 @@ use colibri_core::calibrate::CalibrationCurves;
 mod win;
 
 #[cfg(windows)]
-pub use win::{gamma_ramp, monitors, set_gamma_ramp, PatchWindow};
+pub use win::{gamma_ramp, monitors, set_gamma_ramp, PatchWindow, StatusLine};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Monitor {
@@ -103,6 +103,26 @@ impl PatchWindow {
     pub fn cancelled(&self) -> bool {
         false
     }
+
+    pub fn status_line(&self) -> StatusLine {
+        StatusLine(())
+    }
+
+    pub fn wait_for_start(&self, _prompt: &str) -> Result<(), colibri_core::rig::MeasureError> {
+        Err(colibri_core::rig::MeasureError::Instrument(
+            Error::Unsupported.to_string(),
+        ))
+    }
+}
+
+/// The patch window's corner status text. Unavailable on this system.
+#[cfg(not(windows))]
+#[derive(Clone)]
+pub struct StatusLine(());
+
+#[cfg(not(windows))]
+impl StatusLine {
+    pub fn set(&self, _text: &str) {}
 }
 
 #[cfg(not(windows))]

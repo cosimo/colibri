@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -10,9 +10,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateDCW, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, EnumDisplayMonitors,
-    FillRect, GetMonitorInfoW, InvalidateRect, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
-    PAINTSTRUCT,
+    BeginPaint, CreateDCW, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint,
+    EnumDisplayMonitors, FillRect, GetMonitorInfoW, InvalidateRect, SetBkMode, SetTextColor,
+    DT_BOTTOM, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
@@ -21,13 +22,23 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
     SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, MONITORINFOF_PRIMARY, MSG, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::{Error, GammaRamp, Monitor};
 
 const WM_SHOW_PATCH: u32 = WM_APP + 1;
+const WM_SET_STATUS: u32 = WM_APP + 2;
 const VK_ESCAPE: usize = 0x1B;
+const VK_SPACE: usize = 0x20;
+
+/// The status text is gray, so it adds little light to a dark patch.
+const STATUS_COLOR: u32 = 0x77_77_77;
+/// Gap between the status text and the window edges, in pixels.
+const STATUS_MARGIN: i32 = 16;
+/// Height of the status text line, in pixels. Enough for the default font.
+const STATUS_HEIGHT: i32 = 24;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -135,6 +146,8 @@ struct WindowState {
     awaiting_paint: bool,
     painted: Sender<()>,
     cancelled: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
 }
 
 /// A borderless, topmost window covering one monitor: black, with a centred
@@ -145,6 +158,24 @@ pub struct PatchWindow {
     thread: Option<JoinHandle<()>>,
     painted: Receiver<()>,
     cancelled: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+}
+
+/// Writes the patch window's corner status text, from any thread.
+#[derive(Clone)]
+pub struct StatusLine {
+    hwnd: usize,
+    text: Arc<Mutex<String>>,
+}
+
+impl StatusLine {
+    pub fn set(&self, text: &str) {
+        if let Ok(mut current) = self.text.lock() {
+            *current = text.to_string();
+        }
+        unsafe { PostMessageW(self.hwnd as HWND, WM_SET_STATUS, 0, 0) };
+    }
 }
 
 impl PatchWindow {
@@ -154,12 +185,16 @@ impl PatchWindow {
         let (painted_tx, painted_rx) = channel();
         let (hwnd_tx, hwnd_rx) = channel::<Result<usize, Error>>();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(String::new()));
         let state = WindowState {
             color: 0,
             size: size.clamp(0.05, 1.0),
             awaiting_paint: false,
             painted: painted_tx,
             cancelled: cancelled.clone(),
+            started: started.clone(),
+            status: status.clone(),
         };
         let monitor = monitor.clone();
         let thread = std::thread::spawn(move || unsafe { run_window(monitor, state, hwnd_tx) });
@@ -171,6 +206,8 @@ impl PatchWindow {
             thread: Some(thread),
             painted: painted_rx,
             cancelled,
+            started,
+            status,
         })
     }
 
@@ -190,6 +227,35 @@ impl PatchWindow {
     /// True once the user has pressed Escape in the window.
     pub fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    pub fn status_line(&self) -> StatusLine {
+        StatusLine {
+            hwnd: self.hwnd,
+            text: self.status.clone(),
+        }
+    }
+
+    /// Shows `prompt` in the status line and blocks until Space or a click
+    /// in the window (Ok) or Esc (Err(MeasureError::Cancelled)).
+    ///
+    /// A click starts too, because Windows doesn't always let a console
+    /// program bring its window to the front. Space then goes to the
+    /// terminal, while a click always lands on the patch window.
+    pub fn wait_for_start(&self, prompt: &str) -> Result<(), MeasureError> {
+        let status = self.status_line();
+        self.started.store(false, Ordering::Relaxed);
+        status.set(prompt);
+        loop {
+            if self.cancelled() {
+                return Err(MeasureError::Cancelled);
+            }
+            if self.started.load(Ordering::Relaxed) {
+                status.set("");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -282,6 +348,17 @@ unsafe extern "system" fn window_proc(
             InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
+        WM_SET_STATUS => {
+            // CAUTION! Invalidating the whole window repaints the patch
+            // through black, which could land in the middle of a reading.
+            // Only the text's rectangle is repainted, and it never overlaps
+            // the patch.
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            let text_rect = status_rect(&client, &patch_rect(&client, state.size));
+            InvalidateRect(hwnd, &text_rect, 0);
+            0
+        }
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let dc = BeginPaint(hwnd, &mut ps);
@@ -290,17 +367,25 @@ unsafe extern "system" fn window_proc(
             let black = CreateSolidBrush(0);
             FillRect(dc, &client, black);
             DeleteObject(black);
-            let (w, h) = (client.right - client.left, client.bottom - client.top);
-            let side = (w.min(h) as f64 * state.size).round() as i32;
-            let patch = RECT {
-                left: (w - side) / 2,
-                top: (h - side) / 2,
-                right: (w + side) / 2,
-                bottom: (h + side) / 2,
-            };
+            let patch = patch_rect(&client, state.size);
             let brush = CreateSolidBrush(state.color);
             FillRect(dc, &patch, brush);
             DeleteObject(brush);
+            let text = state.status.lock().map(|t| t.clone()).unwrap_or_default();
+            if !text.is_empty() {
+                let mut text_rect = status_rect(&client, &patch);
+                let text = wide(&text);
+                SetTextColor(dc, STATUS_COLOR);
+                SetBkMode(dc, TRANSPARENT as i32);
+                // The length excludes the trailing nul added by `wide`.
+                DrawTextW(
+                    dc,
+                    text.as_ptr(),
+                    text.len() as i32 - 1,
+                    &mut text_rect,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
             EndPaint(hwnd, &ps);
             if state.awaiting_paint {
                 // Wait for the compositor to present the new frame.
@@ -320,6 +405,14 @@ unsafe extern "system" fn window_proc(
             state.cancelled.store(true, Ordering::Relaxed);
             0
         }
+        WM_KEYDOWN if wparam == VK_SPACE => {
+            state.started.store(true, Ordering::Relaxed);
+            0
+        }
+        WM_LBUTTONDOWN => {
+            state.started.store(true, Ordering::Relaxed);
+            0
+        }
         WM_CLOSE => {
             DestroyWindow(hwnd);
             0
@@ -330,5 +423,36 @@ unsafe extern "system" fn window_proc(
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The centred square patch, `size` being its side as a fraction of the
+/// client area's shorter side.
+fn patch_rect(client: &RECT, size: f64) -> RECT {
+    let (w, h) = (client.right - client.left, client.bottom - client.top);
+    let side = (w.min(h) as f64 * size).round() as i32;
+    RECT {
+        left: (w - side) / 2,
+        top: (h - side) / 2,
+        right: (w + side) / 2,
+        bottom: (h + side) / 2,
+    }
+}
+
+/// The status text line in the bottom-left corner. When it is level with
+/// the patch, it stops short of the patch's left edge, and can end up empty.
+fn status_rect(client: &RECT, patch: &RECT) -> RECT {
+    let bottom = client.bottom - STATUS_MARGIN;
+    let top = bottom - STATUS_HEIGHT;
+    let mut right = client.right - STATUS_MARGIN;
+    let is_level_with_patch = top < patch.bottom && bottom > patch.top;
+    if is_level_with_patch {
+        right = right.min(patch.left - STATUS_MARGIN);
+    }
+    RECT {
+        left: STATUS_MARGIN,
+        top,
+        right: right.max(STATUS_MARGIN),
+        bottom,
     }
 }
