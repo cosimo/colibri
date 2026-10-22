@@ -7,6 +7,8 @@
 // The screens that use it come later.
 #[allow(dead_code)]
 mod flow;
+#[allow(dead_code)]
+mod session;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
