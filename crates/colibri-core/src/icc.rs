@@ -12,7 +12,8 @@
 //! confirmed on real Windows 11 hardware.
 
 use crate::calibrate::{
-    white_channel_amounts, CalibrateError, CalibrationCurves, Characterization, WhitePoint,
+    white_channel_amounts, CalibrateError, Calibration, CalibrationCurves, Characterization,
+    Target, WhitePoint,
 };
 use crate::color::{bradford, rgb_to_xyz_matrix, Xy, Xyz, D65};
 use crate::curve::TargetCurve;
@@ -387,6 +388,61 @@ impl DisplayProfile {
     }
 }
 
+/// Entries per channel in the `MHC2` LUTs of [`calibrated_profile`].
+const MHC2_LUT_SIZE: usize = 1024;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProfileError {
+    Calibrate(CalibrateError),
+    Icc(IccError),
+}
+
+impl std::fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProfileError::Calibrate(e) => e.fmt(f),
+            ProfileError::Icc(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
+impl From<CalibrateError> for ProfileError {
+    fn from(e: CalibrateError) -> ProfileError {
+        ProfileError::Calibrate(e)
+    }
+}
+
+impl From<IccError> for ProfileError {
+    fn from(e: IccError) -> ProfileError {
+        ProfileError::Icc(e)
+    }
+}
+
+/// The display profile for a calibration to `target`: its colorimetry, the
+/// calibration curves as `vcgt`, and an `MHC2` tag doing `gamut`. Needs a
+/// calibration made with an absolute instrument.
+pub fn calibrated_profile(
+    cal: &Calibration,
+    target: Target,
+    gamut: Mhc2Gamut,
+    description: &str,
+    created: [u16; 6],
+) -> Result<DisplayProfile, ProfileError> {
+    let colorimetry = Colorimetry::calibrated(&cal.characterization, target.white)?;
+    let mhc2 = Mhc2::new(&colorimetry, &cal.curves, gamut, MHC2_LUT_SIZE)?;
+    Ok(DisplayProfile {
+        description: description.into(),
+        copyright: "No copyright, use freely".into(),
+        created,
+        colorimetry,
+        tone: target.curve,
+        calibration: Some(cal.curves.clone()),
+        mhc2: Some(mhc2),
+    })
+}
+
 /// ICC profile ID: MD5 of the profile with the flags, rendering intent and
 /// profile ID header fields zeroed.
 pub fn profile_id(profile: &[u8]) -> [u8; 16] {
@@ -583,6 +639,76 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibrate::{calibrate, Options};
+    use crate::testing::toy;
+
+    fn d65_srgb() -> Target {
+        Target {
+            white: WhitePoint::Chromaticity(D65),
+            curve: TargetCurve::Srgb,
+        }
+    }
+
+    fn toy_calibration(trust: Trust, white: WhitePoint) -> Calibration {
+        let target = Target {
+            white,
+            curve: TargetCurve::Srgb,
+        };
+        calibrate(&mut toy(trust), target, Options::default()).unwrap()
+    }
+
+    #[test]
+    fn calibrated_profile_carries_curves_and_mhc2() {
+        let cal = toy_calibration(Trust::Absolute, d65_srgb().white);
+        let created = [2026, 10, 22, 20, 32, 51];
+        let profile =
+            calibrated_profile(&cal, d65_srgb(), Mhc2Gamut::Native, "colibri test", created)
+                .unwrap();
+        assert_eq!(profile.description, "colibri test");
+        assert_eq!(profile.created, created);
+        assert_eq!(profile.tone, TargetCurve::Srgb);
+        assert_eq!(profile.calibration, Some(cal.curves.clone()));
+        assert!(profile.mhc2.is_some());
+        assert!(profile.to_bytes().is_ok());
+    }
+
+    #[test]
+    fn native_gamut_leaves_colours_alone() {
+        let cal = toy_calibration(Trust::Absolute, d65_srgb().white);
+        let profile = calibrated_profile(
+            &cal,
+            d65_srgb(),
+            Mhc2Gamut::Native,
+            "x",
+            [2026, 1, 1, 0, 0, 0],
+        )
+        .unwrap();
+        let m = profile.mhc2.unwrap().matrix3();
+        for c in 0..3 {
+            for r in 0..3 {
+                let off = (m.column(c)[r] - Mat3::IDENTITY.column(c)[r]).abs();
+                assert!(off < 1e-4, "MHC2 matrix is not identity: {m:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn calibrated_profile_needs_absolute_instrument() {
+        let cal = toy_calibration(Trust::Relative, WhitePoint::Native);
+        let result = calibrated_profile(
+            &cal,
+            d65_srgb(),
+            Mhc2Gamut::Native,
+            "x",
+            [2026, 1, 1, 0, 0, 0],
+        );
+        assert!(matches!(
+            result,
+            Err(ProfileError::Calibrate(
+                CalibrateError::NeedsAbsoluteInstrument
+            ))
+        ));
+    }
 
     fn colorimetry() -> Colorimetry {
         // A display with sRGB primaries and D65 white at 100 cd/m², 0.1 black.

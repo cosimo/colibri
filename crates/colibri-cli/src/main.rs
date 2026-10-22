@@ -7,7 +7,7 @@ use std::time::Duration;
 use colibri_core::calibrate::{additivity_error, calibrate, Options, Target, WhitePoint};
 use colibri_core::color::{Xyz, D65};
 use colibri_core::curve::TargetCurve;
-use colibri_core::icc::{Colorimetry, DisplayProfile, Mhc2, Mhc2Gamut, SRGB};
+use colibri_core::icc::{calibrated_profile, Mhc2Gamut, SRGB};
 use colibri_core::math::Vec3;
 use colibri_core::rig::{InstrumentRig, MeasureError, Rig};
 use colibri_sim::{check_grays, SimDisplay, SimRig, SimSensor};
@@ -315,22 +315,14 @@ fn simulate(raw: &[String]) -> Result<(), String> {
     let Some(path) = args.value("out") else {
         return Ok(());
     };
-    let colorimetry =
-        Colorimetry::calibrated(&cal.characterization, target.white).map_err(|e| e.to_string())?;
     let gamut = Mhc2Gamut::Emulate {
         source: SRGB,
         adapt_white: true,
     };
-    let mhc2 = Mhc2::new(&colorimetry, &cal.curves, gamut, 1024).map_err(|e| e.to_string())?;
-    let profile = DisplayProfile {
-        description: "colibri simulated wide-gamut panel".into(),
-        copyright: "No copyright, use freely".into(),
-        created: [2026, 1, 1, 0, 0, 0],
-        colorimetry,
-        tone: target.curve,
-        calibration: Some(cal.curves),
-        mhc2: Some(mhc2),
-    };
+    let description = "colibri simulated wide-gamut panel";
+    let created = [2026, 1, 1, 0, 0, 0];
+    let profile =
+        calibrated_profile(&cal, target, gamut, description, created).map_err(|e| e.to_string())?;
     let bytes = profile.to_bytes().map_err(|e| e.to_string())?;
     std::fs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
     println!("wrote {path} ({} bytes)", bytes.len());
