@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "colibri-spotread"
+version = "0.1.0"
+dependencies = [
+ "colibri-core",
+]
+
+[[package]]
 name = "colibri-windows"
 version = "0.1.0"
 dependencies = [
