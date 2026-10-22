@@ -192,9 +192,10 @@ pub fn characterize<R: Rig + ?Sized>(
     }
     let measure = |rig: &mut R, patch: Rgb| measure_mean(rig, patch, options.repeats);
     let black = measure(rig, [0.0, 0.0, 0.0])?;
-    let r = sub(measure(rig, [1.0, 0.0, 0.0])?, black);
-    let g = sub(measure(rig, [0.0, 1.0, 0.0])?, black);
-    let b = sub(measure(rig, [0.0, 0.0, 1.0])?, black);
+    let red = measure(rig, [1.0, 0.0, 0.0])?;
+    let green = measure(rig, [0.0, 1.0, 0.0])?;
+    let blue = measure(rig, [0.0, 0.0, 1.0])?;
+    let (r, g, b) = (sub(red, black), sub(green, black), sub(blue, black));
     let channel_matrix = Mat3::from_columns(r, g, b);
     let to_linear = channel_matrix
         .inverse()
@@ -220,8 +221,7 @@ pub fn characterize<R: Rig + ?Sized>(
         white = reading;
     }
 
-    let predicted = add(add(black, r), add(g, b));
-    let additivity_error = norm(sub(white, predicted)) / norm(sub(white, black));
+    let additivity_error = additivity_error(black, red, green, blue, white);
 
     let curve = |c: usize| {
         let ys: Vec<f64> = linear.iter().map(|l| l[c]).collect();
@@ -235,6 +235,14 @@ pub fn characterize<R: Rig + ?Sized>(
         additivity_error,
         noise,
     })
+}
+
+/// How far the `white` reading differs from what `red`, `green` and `blue`
+/// add up to, relative to white. All five are raw readings, black included,
+/// so black is subtracted once from each channel.
+pub fn additivity_error(black: Vec3, red: Vec3, green: Vec3, blue: Vec3, white: Vec3) -> f64 {
+    let predicted = sub(add(add(red, green), blue), scale(black, 2.0));
+    norm(sub(white, predicted)) / norm(sub(white, black))
 }
 
 /// Linear output each channel must reach at full white for `white`.
@@ -472,6 +480,22 @@ mod tests {
             black: [0.1, 0.1, 0.12],
             trust,
         }
+    }
+
+    #[test]
+    fn additivity_error_subtracts_black_once_per_channel() {
+        let black = [1.0, 1.0, 1.0];
+        let red = [41.0, 21.0, 3.0];
+        let green = [36.0, 71.0, 12.0];
+        let blue = [19.0, 8.0, 96.0];
+        let additive_white = [94.0, 98.0, 109.0];
+        let error = additivity_error(black, red, green, blue, additive_white);
+        assert!(error < 1e-12, "additive panel reported {error}");
+
+        // White 10% short of black + the three channels.
+        let short_white = add(black, scale([93.0, 97.0, 108.0], 0.9));
+        let error = additivity_error(black, red, green, blue, short_white);
+        assert!((error - 0.1 / 0.9).abs() < 1e-12, "{error}");
     }
 
     #[test]
