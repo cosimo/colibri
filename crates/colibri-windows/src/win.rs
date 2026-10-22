@@ -1,3 +1,5 @@
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -13,8 +15,9 @@ use windows_sys::Win32::Devices::Display::{
     QDC_ONLY_ACTIVE_PATHS,
 };
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND,
-    LPARAM, LRESULT, LUID, RECT, WPARAM,
+    GetLastError, LocalFree, ERROR_CLASS_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, LRESULT, LUID, RECT,
+    WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
@@ -24,7 +27,12 @@ use windows_sys::Win32::Graphics::Gdi::{
     PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
+use windows_sys::Win32::UI::ColorSystem::{
+    ColorProfileAddDisplayAssociation, ColorProfileGetDisplayDefault,
+    ColorProfileRemoveDisplayAssociation, GetDeviceGammaRamp, InstallColorProfileW,
+    SetDeviceGammaRamp, CPST_STANDARD_DISPLAY_COLOR_MODE, CPT_ICC,
+    WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowLongPtrW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
@@ -349,6 +357,106 @@ pub fn set_gamma_ramp(monitor: &Monitor, ramp: &GammaRamp) -> Result<(), Error> 
         }
         Ok(())
     })
+}
+
+/// Profiles are associated for the current user only, so changing them
+/// needs no administrator rights.
+const PROFILE_SCOPE: i32 = WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER;
+
+/// The HRESULT a Win32 error code becomes, as `HRESULT_FROM_WIN32` does.
+fn hresult_from_win32(code: u32) -> i32 {
+    ((code & 0xFFFF) | 0x8007_0000) as i32
+}
+
+fn check_hresult(call: &'static str, hresult: i32) -> Result<(), Error> {
+    if hresult < 0 {
+        return Err(Error::Os(call, hresult as u32));
+    }
+    Ok(())
+}
+
+/// The adapter LUID and source id that every colour profile call takes.
+fn profile_target(monitor: &Monitor) -> Result<(LUID, u32), Error> {
+    let Some(source) = monitor.source else {
+        return Err(Error::UnknownDisplay);
+    };
+    Ok((adapter_luid(&source), source.id))
+}
+
+/// Copies the profile into Windows' colour directory and returns the name
+/// Windows knows it by (its file name). Whether this needs administrator
+/// rights is open (**? to be validated on Windows**).
+pub fn install_profile(path: &Path) -> Result<String, Error> {
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    if unsafe { InstallColorProfileW(std::ptr::null(), wide_path.as_ptr()) } == 0 {
+        return Err(last_error("InstallColorProfileW"));
+    }
+    let name = path.file_name().unwrap_or_default();
+    Ok(name.to_string_lossy().into_owned())
+}
+
+/// The current user's default profile for the display, if any.
+pub fn default_profile(monitor: &Monitor) -> Result<Option<String>, Error> {
+    let (adapter, source_id) = profile_target(monitor)?;
+    let mut name: *mut u16 = std::ptr::null_mut();
+    let hresult = unsafe {
+        ColorProfileGetDisplayDefault(
+            PROFILE_SCOPE,
+            adapter,
+            source_id,
+            CPT_ICC,
+            CPST_STANDARD_DISPLAY_COLOR_MODE,
+            &mut name,
+        )
+    };
+    // A display without a default profile could come back as a not found
+    // error, or as success with no name (**? to be validated on Windows**).
+    let is_no_default = hresult == hresult_from_win32(ERROR_NOT_FOUND)
+        || hresult == hresult_from_win32(ERROR_FILE_NOT_FOUND);
+    if is_no_default {
+        return Ok(None);
+    }
+    check_hresult("ColorProfileGetDisplayDefault", hresult)?;
+    if name.is_null() {
+        return Ok(None);
+    }
+    let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
+    let profile = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) });
+    unsafe { LocalFree(name as _) };
+    Ok(Some(profile))
+}
+
+/// Associates an installed profile with the display, and with
+/// `make_default` makes it the profile Windows applies.
+pub fn associate_profile(
+    monitor: &Monitor,
+    profile: &str,
+    make_default: bool,
+) -> Result<(), Error> {
+    let (adapter, source_id) = profile_target(monitor)?;
+    let profile = wide(profile);
+    let hresult = unsafe {
+        ColorProfileAddDisplayAssociation(
+            PROFILE_SCOPE,
+            profile.as_ptr(),
+            adapter,
+            source_id,
+            make_default as i32,
+            0,
+        )
+    };
+    check_hresult("ColorProfileAddDisplayAssociation", hresult)
+}
+
+/// Removes the profile's association with the display. The profile stays
+/// installed.
+pub fn dissociate_profile(monitor: &Monitor, profile: &str) -> Result<(), Error> {
+    let (adapter, source_id) = profile_target(monitor)?;
+    let profile = wide(profile);
+    let hresult = unsafe {
+        ColorProfileRemoveDisplayAssociation(PROFILE_SCOPE, profile.as_ptr(), adapter, source_id, 0)
+    };
+    check_hresult("ColorProfileRemoveDisplayAssociation", hresult)
 }
 
 /// State shared between the window procedure and its owner.

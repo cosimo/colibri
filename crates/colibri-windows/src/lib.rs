@@ -14,7 +14,10 @@ use colibri_core::calibrate::CalibrationCurves;
 mod win;
 
 #[cfg(windows)]
-pub use win::{color_mode, gamma_ramp, monitors, set_gamma_ramp, PatchWindow, StatusLine};
+pub use win::{
+    associate_profile, color_mode, default_profile, dissociate_profile, gamma_ramp,
+    install_profile, monitors, set_gamma_ramp, PatchWindow, StatusLine,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Monitor {
@@ -114,6 +117,30 @@ pub fn color_mode(_monitor: &Monitor) -> Result<ColorMode, Error> {
 }
 
 #[cfg(not(windows))]
+pub fn install_profile(_path: &std::path::Path) -> Result<String, Error> {
+    Err(Error::Unsupported)
+}
+
+#[cfg(not(windows))]
+pub fn default_profile(_monitor: &Monitor) -> Result<Option<String>, Error> {
+    Err(Error::Unsupported)
+}
+
+#[cfg(not(windows))]
+pub fn associate_profile(
+    _monitor: &Monitor,
+    _profile: &str,
+    _make_default: bool,
+) -> Result<(), Error> {
+    Err(Error::Unsupported)
+}
+
+#[cfg(not(windows))]
+pub fn dissociate_profile(_monitor: &Monitor, _profile: &str) -> Result<(), Error> {
+    Err(Error::Unsupported)
+}
+
+#[cfg(not(windows))]
 pub fn gamma_ramp(_monitor: &Monitor) -> Result<GammaRamp, Error> {
     Err(Error::Unsupported)
 }
@@ -202,6 +229,13 @@ mod tests {
     fn stubs_report_unsupported() {
         assert_eq!(monitors(), Err(Error::Unsupported));
         assert_eq!(color_mode(&monitor()), Err(Error::Unsupported));
+        let path = std::path::Path::new("colibri.icc");
+        assert_eq!(install_profile(path), Err(Error::Unsupported));
+        assert_eq!(default_profile(&monitor()), Err(Error::Unsupported));
+        let associated = associate_profile(&monitor(), "colibri.icc", true);
+        assert_eq!(associated, Err(Error::Unsupported));
+        let dissociated = dissociate_profile(&monitor(), "colibri.icc");
+        assert_eq!(dissociated, Err(Error::Unsupported));
     }
 
     #[test]
