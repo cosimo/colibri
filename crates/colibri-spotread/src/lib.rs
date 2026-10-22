@@ -49,9 +49,10 @@ impl SpotreadInstrument {
     /// `spotread` from `PATH` and `-y e` when not given. An empty `args`
     /// means no extra arguments at all.
     pub fn from_values(program: Option<&str>, args: Option<&str>) -> SpotreadInstrument {
-        let args = args.unwrap_or(DEFAULT_ARGS);
+        let program = unquoted(program.unwrap_or("spotread"));
+        let args = unquoted(args.unwrap_or(DEFAULT_ARGS));
         SpotreadInstrument {
-            program: PathBuf::from(program.unwrap_or("spotread")),
+            program: PathBuf::from(program),
             extra_args: args.split_whitespace().map(String::from).collect(),
             timeout: READING_TIMEOUT,
         }
@@ -93,6 +94,16 @@ impl Instrument for SpotreadInstrument {
     fn trust(&self) -> Trust {
         Trust::Absolute
     }
+}
+
+/// `value` without the double quotes around it. cmd keeps them as part of
+/// the value in `set COLIBRI_SPOTREAD_ARGS="-y e"`.
+fn unquoted(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value)
 }
 
 /// XYZ from the last `Result is XYZ: X Y Z, Yxy: ...` line of `spotread`
@@ -271,6 +282,26 @@ usage: spotread [-options] [logfile]
             PathBuf::from(r"D:\prg\argyll\bin\spotread.exe")
         );
         assert_eq!(custom.extra_args, ["-y", "B", "-Q", "1964_10"]);
+    }
+
+    #[test]
+    fn from_values_drops_quotes_kept_by_cmd() {
+        // cmd's `set COLIBRI_SPOTREAD_ARGS="-y e"` keeps the quotes in the
+        // value, and spotread took `"-y` for a log file name.
+        let quoted = SpotreadInstrument::from_values(
+            Some(r#""C:\Program Files\Argyll\bin\spotread.exe""#),
+            Some(r#""-y e""#),
+        );
+
+        assert_eq!(
+            quoted.program,
+            PathBuf::from(r"C:\Program Files\Argyll\bin\spotread.exe")
+        );
+        assert_eq!(
+            quoted.extra_args,
+            ["-y", "e"],
+            "quoted args reached spotread"
+        );
     }
 
     #[test]
