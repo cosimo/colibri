@@ -14,7 +14,7 @@ use colibri_core::calibrate::CalibrationCurves;
 mod win;
 
 #[cfg(windows)]
-pub use win::{gamma_ramp, monitors, set_gamma_ramp, PatchWindow, StatusLine};
+pub use win::{color_mode, gamma_ramp, monitors, set_gamma_ramp, PatchWindow, StatusLine};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Monitor {
@@ -22,11 +22,38 @@ pub struct Monitor {
     pub index: usize,
     /// GDI device name, such as `\\.\DISPLAY1`.
     pub device: String,
+    /// Friendly name from the display configuration, such as
+    /// `ASUS PA328CGV`, or `device` when there is none.
+    pub name: String,
+    /// How the colour profile APIs identify this display.
+    pub source: Option<DisplaySource>,
     pub left: i32,
     pub top: i32,
     pub width: i32,
     pub height: i32,
     pub primary: bool,
+}
+
+/// A display path from `QueryDisplayConfig`: the adapter's LUID, split in
+/// its two halves, the source id and the target id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplaySource {
+    pub adapter_low: u32,
+    pub adapter_high: i32,
+    /// The colour profile APIs take the source id.
+    pub id: u32,
+    /// The advanced colour queries take the target id.
+    pub target_id: u32,
+}
+
+/// How Windows treats the colours of a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    Sdr,
+    AutoColorManagement,
+    Hdr,
+    /// Windows didn't say. Older than Windows 11 24H2, maybe.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +63,8 @@ pub enum Error {
     Os(&'static str, u32),
     /// The patch window did not respond in time.
     Timeout,
+    /// The display has no [`DisplaySource`].
+    UnknownDisplay,
 }
 
 impl std::fmt::Display for Error {
@@ -44,6 +73,9 @@ impl std::fmt::Display for Error {
             Error::Unsupported => f.write_str("only supported on Windows"),
             Error::Os(call, code) => write!(f, "{call} failed (error {code})"),
             Error::Timeout => f.write_str("the patch window stopped responding"),
+            Error::UnknownDisplay => {
+                f.write_str("display not found in the Windows display configuration")
+            }
         }
     }
 }
@@ -73,6 +105,11 @@ pub fn ramp_from_curves(curves: &CalibrationCurves) -> GammaRamp {
 
 #[cfg(not(windows))]
 pub fn monitors() -> Result<Vec<Monitor>, Error> {
+    Err(Error::Unsupported)
+}
+
+#[cfg(not(windows))]
+pub fn color_mode(_monitor: &Monitor) -> Result<ColorMode, Error> {
     Err(Error::Unsupported)
 }
 
@@ -144,6 +181,28 @@ impl colibri_core::rig::PatchDisplay for PatchWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    pub(crate) fn monitor() -> Monitor {
+        Monitor {
+            index: 0,
+            device: r"\\.\DISPLAY1".into(),
+            name: "ASUS PA328CGV".into(),
+            source: None,
+            left: 0,
+            top: 0,
+            width: 2560,
+            height: 1440,
+            primary: true,
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stubs_report_unsupported() {
+        assert_eq!(monitors(), Err(Error::Unsupported));
+        assert_eq!(color_mode(&monitor()), Err(Error::Unsupported));
+    }
 
     #[test]
     fn identity_curves_give_identity_ramp() {

@@ -106,8 +106,9 @@ fn monitor(args: &Args) -> Result<Monitor, String> {
 fn displays() -> Result<(), String> {
     for m in colibri_windows::monitors().map_err(|e| e.to_string())? {
         println!(
-            "{}: {} {}x{} at ({}, {}){}",
+            "{}: {} ({}) {}x{} at ({}, {}){}",
             m.index,
+            m.name,
             m.device,
             m.width,
             m.height,

@@ -5,8 +5,16 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use colibri_core::rig::{MeasureError, PatchDisplay, Rgb};
+use windows_sys::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    QDC_ONLY_ACTIVE_PATHS,
+};
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND,
+    LPARAM, LRESULT, LUID, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
@@ -26,7 +34,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
-use crate::{Error, GammaRamp, Monitor};
+use crate::{ColorMode, DisplaySource, Error, GammaRamp, Monitor};
 
 const WM_SHOW_PATCH: u32 = WM_APP + 1;
 const WM_SET_STATUS: u32 = WM_APP + 2;
@@ -40,8 +48,35 @@ const STATUS_MARGIN: i32 = 16;
 /// Height of the status text line, in pixels. Enough for the default font.
 const STATUS_HEIGHT: i32 = 24;
 
+/// `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2`, new in Windows 11 24H2 and
+/// missing from windows-sys 0.61.2. The bit fields of its union are kept as
+/// one `u32`. See:
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_get_advanced_color_info_2
+#[repr(C)]
+struct AdvancedColorInfo2 {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    flags: u32,
+    color_encoding: i32,
+    bits_per_color_channel: u32,
+    active_color_mode: i32,
+}
+
+const DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: DISPLAYCONFIG_DEVICE_INFO_TYPE = 15;
+
+// DISPLAYCONFIG_ADVANCED_COLOR_MODE values. WCG is what the Settings app
+// calls Auto Color Management.
+const ADVANCED_COLOR_MODE_SDR: i32 = 0;
+const ADVANCED_COLOR_MODE_WCG: i32 = 1;
+const ADVANCED_COLOR_MODE_HDR: i32 = 2;
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The text of a nul-terminated UTF-16 buffer.
+fn from_wide(s: &[u16]) -> String {
+    let len = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    String::from_utf16_lossy(&s[..len])
 }
 
 fn last_error(call: &'static str) -> Error {
@@ -66,10 +101,12 @@ pub fn monitors() -> Result<Vec<Monitor>, Error> {
         };
         if GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) != 0 {
             let r = info.monitorInfo.rcMonitor;
-            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(32);
+            let device = from_wide(&info.szDevice);
             list.push(Monitor {
                 index: list.len(),
-                device: String::from_utf16_lossy(&info.szDevice[..len]),
+                name: device.clone(),
+                source: None,
+                device,
                 left: r.left,
                 top: r.top,
                 width: r.right - r.left,
@@ -92,7 +129,183 @@ pub fn monitors() -> Result<Vec<Monitor>, Error> {
     if ok == 0 {
         return Err(last_error("EnumDisplayMonitors"));
     }
+
+    // Without the display configuration, monitors keep their GDI name and
+    // no source. The patch window and gamma ramp work without them.
+    let configured = configured_displays().unwrap_or_default();
+    for monitor in &mut list {
+        let Some(display) = configured.iter().find(|d| d.device == monitor.device) else {
+            continue;
+        };
+        if !display.name.is_empty() {
+            monitor.name = display.name.clone();
+        }
+        monitor.source = Some(display.source);
+    }
     Ok(list)
+}
+
+/// An active display path, as `QueryDisplayConfig` describes it.
+struct ConfiguredDisplay {
+    /// GDI device name of the path's source, to match a [`Monitor`].
+    device: String,
+    /// The monitor's friendly name. Empty for some built-in panels.
+    name: String,
+    source: DisplaySource,
+}
+
+fn configured_displays() -> Result<Vec<ConfiguredDisplay>, Error> {
+    let paths = active_paths()?;
+    let mut displays = Vec::new();
+    for path in &paths {
+        let source = &path.sourceInfo;
+        let target = &path.targetInfo;
+        let Some(device) = source_device_name(source.adapterId, source.id) else {
+            continue;
+        };
+        displays.push(ConfiguredDisplay {
+            device,
+            name: target_friendly_name(target.adapterId, target.id).unwrap_or_default(),
+            source: DisplaySource {
+                adapter_low: target.adapterId.LowPart,
+                adapter_high: target.adapterId.HighPart,
+                id: source.id,
+                target_id: target.id,
+            },
+        });
+    }
+    Ok(displays)
+}
+
+/// The active paths of the display configuration. The configuration can
+/// change between sizing the buffers and filling them, so it tries again
+/// a few times.
+fn active_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, Error> {
+    let mut status = ERROR_INSUFFICIENT_BUFFER;
+    for _ in 0..3 {
+        let (mut path_count, mut mode_count) = (0u32, 0u32);
+        status = unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        };
+        if status != ERROR_SUCCESS {
+            return Err(Error::Os("GetDisplayConfigBufferSizes", status));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        status = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            paths.truncate(path_count as usize);
+            return Ok(paths);
+        }
+        if status != ERROR_INSUFFICIENT_BUFFER {
+            break;
+        }
+    }
+    Err(Error::Os("QueryDisplayConfig", status))
+}
+
+fn device_info_header(
+    info_type: DISPLAYCONFIG_DEVICE_INFO_TYPE,
+    size: usize,
+    adapter: LUID,
+    id: u32,
+) -> DISPLAYCONFIG_DEVICE_INFO_HEADER {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER {
+        r#type: info_type,
+        size: size as u32,
+        adapterId: adapter,
+        id,
+    }
+}
+
+/// The GDI name, such as `\\.\DISPLAY1`, of a display configuration source.
+fn source_device_name(adapter: LUID, id: u32) -> Option<String> {
+    let mut request = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        header: device_info_header(
+            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(),
+            adapter,
+            id,
+        ),
+        ..Default::default()
+    };
+    let status = unsafe {
+        DisplayConfigGetDeviceInfo(&mut request as *mut _ as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER)
+    };
+    if status != 0 {
+        return None;
+    }
+    Some(from_wide(&request.viewGdiDeviceName))
+}
+
+/// The monitor's friendly name, such as `ASUS PA328CGV`, from its EDID.
+fn target_friendly_name(adapter: LUID, id: u32) -> Option<String> {
+    let mut request = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        header: device_info_header(
+            DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+            std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>(),
+            adapter,
+            id,
+        ),
+        ..Default::default()
+    };
+    let status = unsafe {
+        DisplayConfigGetDeviceInfo(&mut request as *mut _ as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER)
+    };
+    if status != 0 {
+        return None;
+    }
+    Some(from_wide(&request.monitorFriendlyDeviceName))
+}
+
+fn adapter_luid(source: &DisplaySource) -> LUID {
+    LUID {
+        LowPart: source.adapter_low,
+        HighPart: source.adapter_high,
+    }
+}
+
+/// Whether Windows shows `monitor` in SDR, with Auto Color Management, or
+/// in HDR. Before Windows 11 24H2 the query fails, and the answer is
+/// [`ColorMode::Unknown`] (**? to be validated on Windows**).
+pub fn color_mode(monitor: &Monitor) -> Result<ColorMode, Error> {
+    let Some(source) = monitor.source else {
+        return Err(Error::UnknownDisplay);
+    };
+    let mut info = AdvancedColorInfo2 {
+        header: device_info_header(
+            DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2,
+            std::mem::size_of::<AdvancedColorInfo2>(),
+            adapter_luid(&source),
+            source.target_id,
+        ),
+        flags: 0,
+        color_encoding: 0,
+        bits_per_color_channel: 0,
+        active_color_mode: 0,
+    };
+    let status = unsafe {
+        DisplayConfigGetDeviceInfo(&mut info as *mut _ as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER)
+    };
+    if status != 0 {
+        return Ok(ColorMode::Unknown);
+    }
+    let mode = match info.active_color_mode {
+        ADVANCED_COLOR_MODE_SDR => ColorMode::Sdr,
+        ADVANCED_COLOR_MODE_WCG => ColorMode::AutoColorManagement,
+        ADVANCED_COLOR_MODE_HDR => ColorMode::Hdr,
+        _ => ColorMode::Unknown,
+    };
+    Ok(mode)
 }
 
 fn with_monitor_dc<T>(
