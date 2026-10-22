@@ -25,18 +25,9 @@ cargo run -p colibri-sim --example compare_sensors
 ### Trying it on Windows
 
 There is no instrument backend yet, but the patch window can already be
-checked against ArgyllCMS's own `spotread`:
-
-```
-cargo run --release -p colibri-cli -- displays
-cargo run --release -p colibri-cli -- gamma reset --monitor 0
-cargo run --release -p colibri-cli -- patch --monitor 0 255 255 255
-```
-
-Put the sensor on the patch, run `spotread` in another terminal, and type
-`R G B` values (0-255) into colibri to change the patch. Turn off Auto Color
-Management and any MHC2 profile for that display first, so Windows shows the
-patches untouched.
+checked against ArgyllCMS's own `spotread`. See
+[docs/windows-spyder4-setup.md](docs/windows-spyder4-setup.md) for the full
+procedure with a Spyder4.
 
 Things the simulator has shown so far:
 
