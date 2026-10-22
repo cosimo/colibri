@@ -9,3 +9,5 @@ pub mod math;
 mod md5;
 pub mod rig;
 pub mod spectral;
+#[cfg(test)]
+pub(crate) mod testing;

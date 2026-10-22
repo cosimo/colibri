@@ -67,6 +67,24 @@ impl Default for Options {
     }
 }
 
+/// How many readings [`calibrate`] takes with `options`: black, red, green
+/// and blue, the noise probe, the gray ramp, then each refinement pass.
+///
+/// It is an upper bound when `steps` exceeds the levels the display can
+/// show, since [`characterize`] skips gray levels that repeat.
+pub fn measurement_count(options: &Options) -> usize {
+    let channels = 4 * options.repeats;
+    // The noise probe takes single readings, whatever `repeats` is.
+    let noise_probe = if options.smoothing {
+        2 * NOISE_PROBE
+    } else {
+        0
+    };
+    let ramp = options.steps.saturating_sub(1) * options.repeats;
+    let refinement = options.refine_passes * ramp;
+    channels + noise_probe + ramp + refinement
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CalibrateError {
     Measure(MeasureError),
@@ -454,32 +472,47 @@ fn norm(v: Vec3) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::D65;
+    use crate::testing::toy;
 
-    /// Additive display with per-channel gammas, seen through a fixed sensor matrix.
-    struct ToyRig {
-        gamma: Vec3,
-        sensor: Mat3,
-        black: Vec3,
-        trust: Trust,
-    }
+    /// Counts the readings it is asked for.
+    struct Counting<R>(R, usize);
 
-    impl Rig for ToyRig {
-        fn measure(&mut self, p: Rgb) -> Result<Vec3, MeasureError> {
-            let lin = [0, 1, 2].map(|c| p[c].powf(self.gamma[c]));
-            Ok(add(self.sensor * lin, self.black))
+    impl<R: Rig> Rig for Counting<R> {
+        fn measure(&mut self, patch: Rgb) -> Result<Vec3, MeasureError> {
+            self.1 += 1;
+            self.0.measure(patch)
         }
         fn trust(&self) -> Trust {
-            self.trust
+            self.0.trust()
         }
     }
 
-    fn toy(trust: Trust) -> ToyRig {
-        ToyRig {
-            gamma: [2.0, 2.3, 2.6],
-            sensor: Mat3([[40.0, 35.0, 18.0], [21.0, 70.0, 7.0], [2.0, 12.0, 95.0]]),
-            black: [0.1, 0.1, 0.12],
-            trust,
+    #[test]
+    fn measurement_count_matches_calibrate() {
+        let target = Target {
+            white: WhitePoint::Chromaticity(D65),
+            curve: TargetCurve::Srgb,
+        };
+        let base = Options::default();
+        let cases = [
+            base,
+            Options { repeats: 2, ..base },
+            Options {
+                smoothing: false,
+                ..base
+            },
+            Options {
+                refine_passes: 2,
+                ..base
+            },
+        ];
+        for options in cases {
+            let mut rig = Counting(toy(Trust::Absolute), 0);
+            calibrate(&mut rig, target, options).unwrap();
+            assert_eq!(rig.1, measurement_count(&options), "{options:?}");
         }
+        assert_eq!(measurement_count(&base), 44);
     }
 
     #[test]
