@@ -128,7 +128,7 @@ the same measurements.
 ```
             +---------------------------- colibri desktop ----------------------------+
  sensor --->| instruments    trait Instrument { measure(patch) -> Reading }           |
- (USB)      |   argyll-spotread | i1d3 | spyder | camera-remote | simulated          |
+ (USB)      |   argyll-ffi | camera-remote | simulated                             |
             |                                                                         |
  phone ---->| camera-remote  WebSocket over LAN, paired by QR code; the phone sends  |
  (RAW)      |                linear RAW triplets for a fixed region of interest     |
