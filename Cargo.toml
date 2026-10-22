@@ -6,6 +6,7 @@ members = [
     "crates/colibri-windows",
     "crates/colibri-spotread",
     "crates/colibri-cli",
+    "crates/colibri-gui",
 ]
 
 [workspace.package]
@@ -13,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/cosimo/colibri"
-rust-version = "1.82"
+rust-version = "1.95"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

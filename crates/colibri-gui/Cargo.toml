@@ -1,0 +1,32 @@
+[package]
+name = "colibri-gui"
+description = "colibri desktop window: calibrate a display, compare and keep the profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "colibri-gui"
+path = "src/main.rs"
+
+[dependencies]
+colibri-core = { path = "../colibri-core" }
+colibri-sim = { path = "../colibri-sim" }
+colibri-spotread = { path = "../colibri-spotread" }
+colibri-windows = { path = "../colibri-windows" }
+# glow (OpenGL) instead of the default wgpu: lighter to build, and it runs
+# on any Windows GPU and under WSLg.
+eframe = { version = "=0.37.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
