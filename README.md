@@ -112,13 +112,16 @@ Targets, in order of how common they are:
   create spectral corrections.
 
 ArgyllCMS has the best open documentation of these protocols in the form of
-working drivers. It is AGPLv3. Two ways to use it:
+working drivers. colibri is AGPLv3 like Argyll, so it reuses Argyll's
+instrument layer (`spectro/` and what it depends on) directly: compiled as a
+static C library and called from Rust over FFI. It does not drive the Argyll
+command-line tools. On Windows those tools read keystrokes from the console
+rather than from stdin, so controlling them from another program needs
+console emulation, which is one source of DisplayCAL's fragility.
 
-- **Phase 1**: run Argyll's `spotread` as a separate backend process. This
-  supports every sensor from day one and keeps the licences separate.
-- **Phase 2**: native drivers. Porting Argyll's driver code makes this project
-  a derivative work, so either license colibri as AGPLv3 too or write the
-  drivers clean-room. This has to be decided before any driver code is written.
+Argyll's CLI (`colprof`, `dispwin`, `profcheck`) is still useful as a
+reference: tests compare colibri's profiles against what Argyll produces from
+the same measurements.
 
 ## Architecture (proposed)
 
@@ -155,15 +158,22 @@ in CI without any hardware.
 
 1. **core + simulated instrument**: colour maths, profile fitting, ICC writer,
    with tests against the simulator.
-2. **Argyll backend**: real sensors via `spotread`, patch window, profile
-   install on one OS.
+2. **Argyll instrument layer over FFI**: real sensors, patch window, MHC2
+   profile install on Windows 11.
 3. **Phone camera mode**: gamma, gray balance and uniformity; EDID prior for
    absolute values.
-4. **Native sensor drivers**, beginning with the i1Display Pro family.
+4. **Rust drivers** to replace the C ones, only where they are clearly worth
+   it.
 5. **HDR**: PQ tone response, peak luminance and EOTF tracking checks.
+
+## Decisions
+
+- Licence: AGPLv3 (the full text still needs to be added as `LICENSE`).
+- First OS: Windows 11. Profiles carry an `MHC2` tag so Windows' colour
+  pipeline applies the calibration with high precision, including in HDR and
+  Auto Color Management mode where the classic gamma ramp is not used.
+- Instruments: Argyll's driver code linked in-process.
 
 ## Open decisions
 
-- Licence (AGPLv3 vs permissive), which determines the approach to drivers.
-- First OS to support.
 - UI toolkit.
