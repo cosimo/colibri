@@ -180,7 +180,63 @@ then not the panel's own, so reset the ramp as in step 6 and run it again.
 checks with `spotread` by hand. It needs a second monitor for the
 terminals, since the patch window covers the one it is on.
 
-## 8. What to report back
+## 8. Try the GUI
+
+`colibri-gui` runs the whole calibration: it measures 44 patches, builds
+the profile, installs it, and lets you flip the display between the
+previous profile and the new one before keeping it.
+
+It reads the Spyder4 the same way `colibri check` does, so the
+`COLIBRI_SPOTREAD_ARGS` setting from step 7 applies. If Argyll isn't on
+`PATH`, set `COLIBRI_SPOTREAD` to the full path of `spotread.exe`. In
+PowerShell:
+
+```
+$env:COLIBRI_SPOTREAD = "C:\Argyll\bin\spotread.exe"
+cargo run --release -p colibri-gui
+```
+
+A release build opens no console window. `cargo run -p colibri-gui`, a
+debug build, keeps one, which helps if something goes wrong.
+
+Auto Color Management, Night light and HDR still have to be off, as in
+step 6. The GUI removes the display's profile and resets the gamma ramp by
+itself before measuring, and puts both back afterwards. Profiles are saved
+in `%LOCALAPPDATA%\colibri\profiles\`.
+
+Please try these, and note what happened for each:
+
+- The Ready screen with one display, and with two: the display names, and
+  whether the one chosen is the primary.
+- Auto Color Management left on: whether Calibrate is disabled, with a
+  message naming the setting and the display. If Calibrate stays enabled,
+  colibri couldn't read the colour mode.
+- A full Spyder4 run: how long it took, and whether the progress line in
+  the corner ever showed through the patch.
+- Esc during measuring: whether the previous profile is back in `colorcpl`,
+  and whether `colibri gamma show` says `identity: true` only if it did
+  before the run.
+- The Before/After switch, with the mouse or Space: how long each flip
+  takes, any flicker, and whether the new profile visibly applies without
+  signing out. If it doesn't, colibri needs another way to switch.
+- Whether installing the profile asked for administrator rights.
+- Keep, and in another run Discard: which profiles `colorcpl` then shows
+  for the display, and which one is the default.
+- Ending colibri from Task Manager while in Compare, then starting it
+  again: the message on the Ready screen, and whether the previous profile
+  is the default again.
+- The output of these two, pasted as they are:
+
+  ```
+  spotread -e -O -x -y e
+  spotread -?
+  ```
+
+  The first takes one reading straight away, so put the sensor on
+  something lit. These replace the made-up samples in
+  `crates/colibri-spotread/src/lib.rs` with real ones.
+
+## 9. What to report back
 
 Please paste:
 
@@ -193,6 +249,7 @@ Please paste:
 5. Anything that misbehaved: the patch window not appearing or not covering
    the monitor, wrong colours, Space or the click not starting the run, a
    reading timing out, or error messages.
+6. What you noted for each item in step 8.
 
 From that, colibri's Spyder4 backend gets its trust level and display-type
 correction, and the patch window gets its first real test.

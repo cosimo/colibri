@@ -18,16 +18,24 @@ cargo run -p colibri-sim --example compare_sensors
 | Crate | What it holds |
 |---|---|
 | `colibri-core` | Colorimetry (XYZ, Lab, ΔE2000, Bradford, RGB matrices), noise-aware tone curve fitting, the `Rig` instrument trait, calibration with optional closed-loop refinement, and an ICC v4 profile writer with `vcgt` and Microsoft's `MHC2` tag. No dependencies. |
-| `colibri-windows` | Windows integration: monitor list, a full-screen 8-bit patch window, GPU gamma ramp read/reset. |
-| `colibri-cli` | The `colibri` command: `displays`, `patch`, `gamma`, `simulate`. |
+| `colibri-windows` | Windows integration: monitor list with friendly names, the display's colour mode, a full-screen 8-bit patch window with a status line, GPU gamma ramp read/reset, and installing a profile and making it a display's default. |
+| `colibri-spotread` | Spyder4 readings through ArgyllCMS's `spotread`, one process per reading. A test stand-in until colibri drives the sensor itself. |
+| `colibri-cli` | The `colibri` command: `displays`, `patch`, `gamma`, `check`, `simulate`. |
+| `colibri-gui` | The `colibri-gui` window, built with egui: pick a display, calibrate it with the Spyder4 or the simulator, flip the display between the previous profile and the new one, then keep it or not. |
 | `colibri-sim` | Spectral display model (with ripple and channel interaction) and simulated colorimeter, aged colorimeter and RAW phone camera, an emulation of Windows' MHC2 pipeline, and a ground-truth checker. |
 
 ### Trying it on Windows
 
-There is no instrument backend yet, but the patch window can already be
-checked against ArgyllCMS's own `spotread`. See
-[docs/windows-spyder4-setup.md](docs/windows-spyder4-setup.md) for the full
-procedure with a Spyder4.
+colibri can't drive an instrument itself yet. For testing, it reads a
+Spyder4 through ArgyllCMS's own `spotread`, one reading at a time. The GUI
+starts with:
+
+```
+cargo run --release -p colibri-gui
+```
+
+See [docs/windows-spyder4-setup.md](docs/windows-spyder4-setup.md) for the
+full procedure with a Spyder4, and what to try in the GUI.
 
 Things the simulator has shown so far:
 
