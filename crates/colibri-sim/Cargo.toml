@@ -1,0 +1,14 @@
+[package]
+name = "colibri-sim"
+description = "Spectral display and sensor simulator for testing colibri without hardware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+colibri-core = { path = "../colibri-core" }
+
+[lints]
+workspace = true
