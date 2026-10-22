@@ -54,6 +54,36 @@ impl ToneCurve {
         })
     }
 
+    /// Like [`ToneCurve::from_samples`], but smooths measurement noise first.
+    ///
+    /// Samples must be evenly spaced and start at drive 0. The curve is split
+    /// into a power law fitted to the data and a slowly varying residual
+    /// factor; only the residual is smoothed, so the steep shape near black is
+    /// kept. Each sample is weighted by its expected noise, and the smoothing
+    /// strength is chosen from the data by generalized cross-validation, so
+    /// real detail in the response survives when it stands out of the noise.
+    pub fn fit(xs: &[f64], ys: &[f64], noise: Noise) -> Result<ToneCurve, CurveError> {
+        if noise.is_zero() || xs.len() < 4 || xs.len() != ys.len() || xs[0] != 0.0 {
+            return ToneCurve::from_samples(xs, ys);
+        }
+        let y_max = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let Some(gamma) = power_law_exponent(xs, ys, 0.01 * y_max) else {
+            return ToneCurve::from_samples(xs, ys);
+        };
+        let shape: Vec<f64> = xs[1..].iter().map(|x| x.powf(gamma)).collect();
+        let residual: Vec<f64> = ys[1..].iter().zip(&shape).map(|(y, p)| y / p).collect();
+        // The residual's variance is the reading's variance divided by y².
+        let weights: Vec<f64> = shape
+            .iter()
+            .zip(&residual)
+            .map(|(p, r)| 1.0 / noise.relative_variance(p * r.max(0.0)))
+            .collect();
+        let (smoothed, _) = smooth_auto(&residual, &weights);
+        let mut fitted = vec![ys[0]];
+        fitted.extend(smoothed.iter().zip(&shape).map(|(r, p)| r * p));
+        ToneCurve::from_samples(xs, &fitted)
+    }
+
     pub fn min_output(&self) -> f64 {
         self.ys[0]
     }
@@ -103,6 +133,141 @@ impl ToneCurve {
         }
         0.5 * (lo + hi)
     }
+}
+
+/// Least-squares exponent of `y = c·x^γ` over samples with `y > min_y` and `x > 0`.
+fn power_law_exponent(xs: &[f64], ys: &[f64], min_y: f64) -> Option<f64> {
+    let pts: Vec<(f64, f64)> = xs
+        .iter()
+        .zip(ys)
+        .filter(|(x, y)| **x > 0.0 && **y > min_y)
+        .map(|(x, y)| (x.ln(), y.ln()))
+        .collect();
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let (mx, my) = pts
+        .iter()
+        .fold((0.0, 0.0), |(a, b), (x, y)| (a + x / n, b + y / n));
+    let sxx: f64 = pts.iter().map(|(x, _)| (x - mx).powi(2)).sum();
+    let sxy: f64 = pts.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    (sxx > 0.0)
+        .then(|| sxy / sxx)
+        .filter(|g| g.is_finite() && *g > 0.0)
+}
+
+/// Measurement noise model: a part proportional to the signal and a floor
+/// independent of it, both as standard deviations.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Noise {
+    pub relative: f64,
+    pub floor: f64,
+}
+
+impl Noise {
+    pub fn is_zero(&self) -> bool {
+        self.relative <= 0.0 && self.floor <= 0.0
+    }
+
+    /// Variance of a reading of `y`.
+    pub fn variance(&self, y: f64) -> f64 {
+        (self.relative * y).powi(2) + self.floor.powi(2)
+    }
+
+    /// Variance of a reading of `y`, relative to `y`.
+    pub fn relative_variance(&self, y: f64) -> f64 {
+        let y = y.abs().max(1e-12);
+        self.variance(y) / (y * y)
+    }
+}
+
+/// Weighted Whittaker–Eilers smoother for evenly spaced samples: minimises
+/// Σ wᵢ(yᵢ − zᵢ)² + λ Σ (Δ²zᵢ)². Large λ tends towards a straight line.
+/// Weights should be inverse variances.
+pub fn smooth(ys: &[f64], weights: &[f64], lambda: f64) -> Vec<f64> {
+    if ys.len() < 3 || lambda <= 0.0 {
+        return ys.to_vec();
+    }
+    whittaker(ys, weights, lambda).0
+}
+
+/// [`smooth`] with λ chosen by generalized cross-validation. Returns the
+/// smoothed values and the λ used.
+pub fn smooth_auto(ys: &[f64], weights: &[f64]) -> (Vec<f64>, f64) {
+    if ys.len() < 4 {
+        return (ys.to_vec(), 0.0);
+    }
+    let n = ys.len() as f64;
+    let mut best = (ys.to_vec(), 0.0, f64::INFINITY);
+    for e in -4..=12 {
+        let lambda = 10f64.powf(e as f64 / 2.0);
+        let (z, trace) = whittaker(ys, weights, lambda);
+        let rss: f64 = (0..ys.len())
+            .map(|i| weights[i] * (ys[i] - z[i]).powi(2))
+            .sum();
+        let score = n * rss / (n - trace).powi(2);
+        if score < best.2 {
+            best = (z, lambda, score);
+        }
+    }
+    (best.0, best.1)
+}
+
+/// Solve (W + λ·DᵀD) z = W·y, with D the second-difference matrix. Also
+/// returns the trace of the hat matrix (the effective number of parameters).
+fn whittaker(ys: &[f64], weights: &[f64], lambda: f64) -> (Vec<f64>, f64) {
+    let n = ys.len();
+    let mut a = vec![vec![0.0; n]; n];
+    for (i, row) in a.iter_mut().enumerate() {
+        row[i] = weights[i];
+    }
+    for k in 0..n - 2 {
+        let d = [(k, 1.0), (k + 1, -2.0), (k + 2, 1.0)];
+        for &(i, di) in &d {
+            for &(j, dj) in &d {
+                a[i][j] += lambda * di * dj;
+            }
+        }
+    }
+    let inv = invert(a);
+    let wy: Vec<f64> = (0..n).map(|i| weights[i] * ys[i]).collect();
+    let z = inv
+        .iter()
+        .map(|row| row.iter().zip(&wy).map(|(a, b)| a * b).sum())
+        .collect();
+    let trace = (0..n).map(|i| inv[i][i] * weights[i]).sum();
+    (z, trace)
+}
+
+/// Gauss–Jordan inverse of a small, well-conditioned matrix.
+fn invert(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    let n = a.len();
+    let mut inv: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+        .collect();
+    for col in 0..n {
+        let pivot = (col..n)
+            .max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))
+            .unwrap();
+        a.swap(col, pivot);
+        inv.swap(col, pivot);
+        let p = a[col][col];
+        for k in 0..n {
+            a[col][k] /= p;
+            inv[col][k] /= p;
+        }
+        for row in 0..n {
+            let f = a[row][col];
+            if row != col && f != 0.0 {
+                for k in 0..n {
+                    a[row][k] -= f * a[col][k];
+                    inv[row][k] -= f * inv[col][k];
+                }
+            }
+        }
+    }
+    inv
 }
 
 /// Pool-adjacent-violators: the closest non-decreasing sequence in least squares.
@@ -243,6 +408,80 @@ mod tests {
             ToneCurve::from_samples(&[0.0, 1.0], &[1.0, 1.0]),
             Err(CurveError::NoResponse)
         );
+    }
+
+    #[test]
+    fn smoothing_keeps_lines_and_reduces_noise() {
+        let line: Vec<f64> = (0..20).map(|i| 0.5 + 0.1 * i as f64).collect();
+        let w = vec![1.0; 20];
+        for (a, b) in smooth(&line, &w, 1e3).iter().zip(&line) {
+            assert!((a - b).abs() < 1e-9, "a straight line is left alone");
+        }
+        let noisy: Vec<f64> = (0..20)
+            .map(|i| if i % 2 == 0 { 1.01 } else { 0.99 })
+            .collect();
+        let out = smooth(&noisy, &w, 10.0);
+        // Ends have fewer neighbours to average with.
+        assert!(
+            out[3..17].iter().all(|v| (v - 1.0).abs() < 0.001),
+            "{out:?}"
+        );
+        assert!(out.iter().all(|v| (v - 1.0).abs() < 0.005), "{out:?}");
+    }
+
+    #[test]
+    fn fit_recovers_gamma_through_noise() {
+        let n = 33;
+        let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+        // Deterministic ±0.5% alternating error.
+        let ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x.powf(2.4) * if i % 2 == 0 { 1.005 } else { 0.995 })
+            .collect();
+        let raw = ToneCurve::from_samples(&xs, &ys).unwrap();
+        let noise = Noise {
+            relative: 0.005,
+            floor: 0.0,
+        };
+        let fitted = ToneCurve::fit(&xs, &ys, noise).unwrap();
+        let err = |c: &ToneCurve| {
+            // Above 0.1: below that, interpolation between samples dominates.
+            (10..100)
+                .map(|i| {
+                    let x = i as f64 / 100.0;
+                    (c.eval(x) / x.powf(2.4) - 1.0).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        assert!(
+            err(&fitted) < 0.35 * err(&raw),
+            "{} vs {}",
+            err(&fitted),
+            err(&raw)
+        );
+    }
+
+    #[test]
+    fn fit_keeps_detail_that_stands_out_of_the_noise() {
+        // A 3% ripple measured with 0.1% noise must not be smoothed away.
+        let n = 33;
+        let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+        let truth = |x: f64| x.powf(2.2) * (1.0 + 0.03 * (8.0 * std::f64::consts::PI * x).sin());
+        let ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| truth(x) * if i % 2 == 0 { 1.001 } else { 0.999 })
+            .collect();
+        let noise = Noise {
+            relative: 0.001,
+            floor: 0.0,
+        };
+        let fitted = ToneCurve::fit(&xs, &ys, noise).unwrap();
+        for &x in &xs[8..] {
+            let rel = fitted.eval(x) / truth(x) - 1.0;
+            assert!(rel.abs() < 0.004, "x={x}: {rel}");
+        }
     }
 
     #[test]

@@ -16,6 +16,15 @@ pub struct SimDisplay {
     /// Radiance at zero drive.
     pub black: Spectrum,
     pub gamma: Vec3,
+    /// Amplitude of a ripple on each channel's response, as panels with
+    /// coarse firmware lookup tables have: output is multiplied by
+    /// `1 + ripple·sin(8π·drive)`. Must stay below about 0.08 to keep the
+    /// response increasing.
+    pub ripple: Vec3,
+    /// Channel interaction: each channel's output drops by this fraction of
+    /// the mean output of the other two, as with power limiting on OLEDs or
+    /// crosstalk on LCDs. Makes the display non-additive.
+    pub crosstalk: f64,
     /// Curves applied to every input before it reaches the panel.
     pub curves: Option<CalibrationCurves>,
     /// Bit depth of the link to the panel. Drive values are rounded to it.
@@ -50,6 +59,8 @@ impl SimDisplay {
             black: white.scaled(k / contrast),
             primaries: shapes.map(|s| s.scaled(k)),
             gamma,
+            ripple: [0.0; 3],
+            crosstalk: 0.0,
             curves: None,
             output_bits: None,
             cmf,
@@ -125,8 +136,14 @@ impl SimDisplay {
     /// Emitted radiance for `input`.
     pub fn spectrum(&self, input: Rgb) -> Spectrum {
         let d = self.drive(input);
+        let lin = [0, 1, 2].map(|c| {
+            let ripple = 1.0 + self.ripple[c] * (8.0 * std::f64::consts::PI * d[c]).sin();
+            d[c].powf(self.gamma[c]) * ripple
+        });
+        let total: f64 = lin.iter().sum();
         (0..3).fold(self.black.clone(), |acc, c| {
-            acc.add_scaled(&self.primaries[c], d[c].powf(self.gamma[c]))
+            let others = (total - lin[c]) / 2.0;
+            acc.add_scaled(&self.primaries[c], lin[c] * (1.0 - self.crosstalk * others))
         })
     }
 

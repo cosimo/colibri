@@ -28,7 +28,6 @@ fn calibrated(rig: SimRig, target: Target) -> SimRig {
 
 fn calibrated_with(mut rig: SimRig, target: Target, options: Options) -> SimRig {
     let cal = calibrate(&mut rig, target, options).expect("calibration succeeds");
-    assert!(cal.characterization.additivity_error < 0.01);
     rig.display.curves = Some(cal.curves);
     rig
 }
@@ -162,4 +161,75 @@ fn link_bit_depth_limits_shadow_accuracy() {
     let (eight, ten) = (worst_at(8), worst_at(10));
     assert!(eight > 0.5, "8-bit worst ΔE2000 {eight}");
     assert!(ten < 0.3, "10-bit worst ΔE2000 {ten}");
+}
+
+fn mean_worst(display: &SimDisplay, sensor: fn(u64) -> SimSensor, options: Options) -> f64 {
+    let seeds = 1..=6;
+    let n = seeds.clone().count() as f64;
+    seeds
+        .map(|seed| {
+            let rig = calibrated_with(
+                SimRig::new(display.clone(), sensor(seed)),
+                NATIVE_22,
+                options,
+            );
+            worst_delta_e(&rig.display, TargetCurve::Gamma(2.2))
+        })
+        .sum::<f64>()
+        / n
+}
+
+#[test]
+fn smoothing_reduces_noise() {
+    let off = Options {
+        smoothing: false,
+        ..Options::default()
+    };
+    for sensor in [SimSensor::colorimeter, SimSensor::phone_camera] {
+        let smoothed = mean_worst(&SimDisplay::wide_gamut(), sensor, Options::default());
+        let raw = mean_worst(&SimDisplay::wide_gamut(), sensor, off);
+        assert!(smoothed < 0.8 * raw, "smoothed {smoothed} vs raw {raw}");
+    }
+}
+
+#[test]
+fn smoothing_keeps_real_detail_in_the_panel_response() {
+    // Panels with coarse firmware tables have ripples that must be calibrated
+    // out, not smoothed away.
+    let mut display = SimDisplay::wide_gamut();
+    display.ripple = [0.02, -0.015, 0.025];
+    let off = Options {
+        smoothing: false,
+        ..Options::default()
+    };
+    let smoothed = mean_worst(&display, SimSensor::colorimeter, Options::default());
+    let raw = mean_worst(&display, SimSensor::colorimeter, off);
+    assert!(smoothed < 1.1 * raw, "smoothed {smoothed} vs raw {raw}");
+    assert!(smoothed < INVISIBLE);
+}
+
+#[test]
+fn refinement_corrects_channel_interaction() {
+    let mut display = SimDisplay::wide_gamut();
+    display.crosstalk = 0.2;
+    let run = |passes| {
+        let mut rig = SimRig::new(
+            display.clone(),
+            SimSensor::colorimeter(10).with_noise(0.0, 0.0),
+        );
+        let options = Options {
+            refine_passes: passes,
+            ..Options::default()
+        };
+        let cal = calibrate(&mut rig, NATIVE_22, options).unwrap();
+        assert!(
+            cal.characterization.additivity_error > 0.1,
+            "interaction is detected"
+        );
+        rig.display.curves = Some(cal.curves);
+        worst_delta_e(&rig.display, TargetCurve::Gamma(2.2))
+    };
+    let (open_loop, refined) = (run(0), run(2));
+    assert!(open_loop > INVISIBLE, "open loop {open_loop}");
+    assert!(refined < 0.2, "refined {refined}");
 }

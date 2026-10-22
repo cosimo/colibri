@@ -11,7 +11,7 @@
 //! instrument.
 
 use crate::color::Xy;
-use crate::curve::{CurveError, TargetCurve, ToneCurve};
+use crate::curve::{smooth_auto, CurveError, Noise, TargetCurve, ToneCurve};
 use crate::math::{add, scale, sub, Mat3, Vec3};
 use crate::rig::{MeasureError, Rgb, Rig, Trust};
 
@@ -37,15 +37,31 @@ pub struct Options {
     /// Readings averaged per patch. Instrument noise is the main error source
     /// once there are enough steps, and it falls with the square root of this.
     pub repeats: usize,
+    /// Smooth measurement noise out of the tone curves and refinement
+    /// corrections. Costs `NOISE_PROBE` × 2 extra patches to measure the
+    /// instrument's noise; the strength is then chosen from the data.
+    pub smoothing: bool,
+    /// Closed-loop passes after the first calibration: show the calibrated
+    /// grays, measure them and correct the curves. Each pass costs `steps`
+    /// patches (times `repeats`).
+    pub refine_passes: usize,
     /// Entries per channel in the output curves.
     pub lut_size: usize,
 }
+
+const SMOOTHING_DEFAULT: bool = true;
+const REFINE_DEFAULT: usize = 0;
+
+/// Readings of white and of black taken to estimate the instrument's noise.
+pub const NOISE_PROBE: usize = 4;
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             steps: 33,
             repeats: 1,
+            smoothing: SMOOTHING_DEFAULT,
+            refine_passes: REFINE_DEFAULT,
             lut_size: 1024,
         }
     }
@@ -113,6 +129,9 @@ pub struct Characterization {
     /// white. Near 0 for a well-behaved panel; large values mean the channels
     /// interact and a 1D calibration will be less accurate.
     pub additivity_error: f64,
+    /// Estimated noise of one averaged ramp reading, per channel, in the
+    /// same units as `curves`. Zero when smoothing is off.
+    pub noise: [Noise; 3],
 }
 
 /// Per-channel 1D curves: input level (evenly spaced over 0–1) → drive value.
@@ -171,28 +190,27 @@ pub fn characterize<R: Rig + ?Sized>(
     if options.repeats == 0 {
         return Err(CalibrateError::InvalidOptions("repeats must be at least 1"));
     }
-    let mut measure = |patch: Rgb| -> Result<Vec3, MeasureError> {
-        let mut sum = [0.0; 3];
-        for _ in 0..options.repeats {
-            sum = add(sum, rig.measure(patch)?);
-        }
-        Ok(scale(sum, 1.0 / options.repeats as f64))
-    };
-    let black = measure([0.0, 0.0, 0.0])?;
-    let r = sub(measure([1.0, 0.0, 0.0])?, black);
-    let g = sub(measure([0.0, 1.0, 0.0])?, black);
-    let b = sub(measure([0.0, 0.0, 1.0])?, black);
+    let measure = |rig: &mut R, patch: Rgb| measure_mean(rig, patch, options.repeats);
+    let black = measure(rig, [0.0, 0.0, 0.0])?;
+    let r = sub(measure(rig, [1.0, 0.0, 0.0])?, black);
+    let g = sub(measure(rig, [0.0, 1.0, 0.0])?, black);
+    let b = sub(measure(rig, [0.0, 0.0, 1.0])?, black);
     let channel_matrix = Mat3::from_columns(r, g, b);
     let to_linear = channel_matrix
         .inverse()
         .ok_or(CalibrateError::DegenerateChannels)?;
+    let noise = if options.smoothing {
+        probe_noise(rig, &to_linear, options.repeats)?
+    } else {
+        [Noise::default(); 3]
+    };
 
     let mut drives = vec![0.0];
     let mut linear: Vec<Vec3> = vec![[0.0; 3]];
     let mut white = black;
     for i in 1..steps {
         let s = i as f64 / (steps - 1) as f64;
-        let reading = measure([s, s, s])?;
+        let reading = measure(rig, [s, s, s])?;
         drives.push(s);
         linear.push(to_linear * sub(reading, black));
         white = reading;
@@ -203,7 +221,7 @@ pub fn characterize<R: Rig + ?Sized>(
 
     let curve = |c: usize| {
         let ys: Vec<f64> = linear.iter().map(|l| l[c]).collect();
-        ToneCurve::from_samples(&drives, &ys)
+        ToneCurve::fit(&drives, &ys, noise[c])
     };
     Ok(Characterization {
         trust,
@@ -211,6 +229,7 @@ pub fn characterize<R: Rig + ?Sized>(
         channel_matrix,
         curves: [curve(0)?, curve(1)?, curve(2)?],
         additivity_error,
+        noise,
     })
 }
 
@@ -272,6 +291,128 @@ pub fn build_curves(
     Ok(CalibrationCurves { channels })
 }
 
+/// Show the grays produced by `curves`, measure them and return corrected
+/// curves. This removes errors the characterization cannot see: channels that
+/// interact, detail lost to smoothing, wiggles in the panel's own response.
+/// Like [`characterize`], it needs the GPU curves reset to identity, because
+/// it shows the calibrated drive values directly.
+pub fn refine<R: Rig + ?Sized>(
+    rig: &mut R,
+    ch: &Characterization,
+    curves: &CalibrationCurves,
+    target: Target,
+    options: &Options,
+) -> Result<CalibrationCurves, CalibrateError> {
+    let steps = options.steps;
+    if steps < 2 || options.repeats == 0 {
+        return Err(CalibrateError::InvalidOptions(
+            "steps must be at least 2 and repeats at least 1",
+        ));
+    }
+    let amounts = white_channel_amounts(ch, target.white)?;
+    let to_linear = ch
+        .channel_matrix
+        .inverse()
+        .ok_or(CalibrateError::DegenerateChannels)?;
+
+    // Drive correction per channel at each ramp level; black stays black.
+    let mut deltas = [
+        vec![0.0; steps - 1],
+        vec![0.0; steps - 1],
+        vec![0.0; steps - 1],
+    ];
+    let mut weights = [
+        vec![0.0; steps - 1],
+        vec![0.0; steps - 1],
+        vec![0.0; steps - 1],
+    ];
+    for i in 1..steps {
+        let v = i as f64 / (steps - 1) as f64;
+        let drive = curves.apply([v, v, v]);
+        let linear = to_linear * sub(measure_mean(rig, drive, options.repeats)?, ch.black);
+        let level = target.curve.eval(v);
+        for c in 0..3 {
+            let curve = &ch.curves[c];
+            let wanted = curve.eval(drive[c]) + amounts[c] * level - linear[c];
+            deltas[c][i - 1] = curve.inverse(wanted) - drive[c];
+            // A reading error σ moves the drive correction by σ / slope.
+            let h = 1e-3;
+            let slope = (curve.eval(drive[c] + h) - curve.eval(drive[c] - h)) / (2.0 * h);
+            let var = ch.noise[c].variance(amounts[c] * level) / slope.max(1e-6).powi(2);
+            weights[c][i - 1] = 1.0 / var.max(1e-18);
+        }
+    }
+
+    let channels = [0, 1, 2].map(|c| {
+        let mut d = vec![0.0];
+        if options.smoothing && !ch.noise[c].is_zero() {
+            d.extend(smooth_auto(&deltas[c], &weights[c]).0);
+        } else {
+            d.extend(&deltas[c]);
+        }
+        let lut = &curves.channels[c];
+        let n = lut.len();
+        let mut out = Vec::with_capacity(n);
+        let mut prev = 0.0_f64;
+        for (j, &old) in lut.iter().enumerate() {
+            let pos = j as f64 / (n - 1) as f64 * (steps - 1) as f64;
+            let k = (pos.floor() as usize).min(steps - 2);
+            let t = pos - k as f64;
+            let delta = d[k] * (1.0 - t) + d[k + 1] * t;
+            // Keep the curve inside 0–1 and non-decreasing.
+            prev = (old + delta).clamp(0.0, 1.0).max(prev);
+            out.push(prev);
+        }
+        out
+    });
+    Ok(CalibrationCurves { channels })
+}
+
+/// Estimate per-channel noise of an averaged reading, from repeated single
+/// readings of white (proportional part) and black (floor).
+fn probe_noise<R: Rig + ?Sized>(
+    rig: &mut R,
+    to_linear: &Mat3,
+    repeats: usize,
+) -> Result<[Noise; 3], MeasureError> {
+    let mut read = |patch: Rgb| -> Result<Vec<Vec3>, MeasureError> {
+        (0..NOISE_PROBE)
+            .map(|_| rig.measure(patch).map(|v| *to_linear * v))
+            .collect()
+    };
+    let white = read([1.0; 3])?;
+    let black = read([0.0; 3])?;
+    let stats = |samples: &[Vec3], c: usize| {
+        let n = samples.len() as f64;
+        let mean = samples.iter().map(|s| s[c]).sum::<f64>() / n;
+        let var = samples.iter().map(|s| (s[c] - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        (mean, var.sqrt())
+    };
+    // Averaging `repeats` readings divides the standard deviation by √repeats.
+    let k = 1.0 / (repeats as f64).sqrt();
+    Ok([0, 1, 2].map(|c| {
+        let (w_mean, w_sd) = stats(&white, c);
+        let (_, floor) = stats(&black, c);
+        let relative = (w_sd.powi(2) - floor.powi(2)).max(0.0).sqrt() / w_mean.abs().max(1e-12);
+        Noise {
+            relative: relative * k,
+            floor: floor * k,
+        }
+    }))
+}
+
+fn measure_mean<R: Rig + ?Sized>(
+    rig: &mut R,
+    patch: Rgb,
+    repeats: usize,
+) -> Result<Vec3, MeasureError> {
+    let mut sum = [0.0; 3];
+    for _ in 0..repeats {
+        sum = add(sum, rig.measure(patch)?);
+    }
+    Ok(scale(sum, 1.0 / repeats as f64))
+}
+
 /// Characterize the display and build calibration curves in one go.
 pub fn calibrate<R: Rig + ?Sized>(
     rig: &mut R,
@@ -283,7 +424,10 @@ pub fn calibrate<R: Rig + ?Sized>(
         return Err(CalibrateError::NeedsAbsoluteInstrument);
     }
     let characterization = characterize(rig, &options)?;
-    let curves = build_curves(&characterization, target, options.lut_size)?;
+    let mut curves = build_curves(&characterization, target, options.lut_size)?;
+    for _ in 0..options.refine_passes {
+        curves = refine(rig, &characterization, &curves, target, &options)?;
+    }
     Ok(Calibration {
         characterization,
         curves,
