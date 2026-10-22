@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 colibri-core = { path = "../colibri-core" }
 colibri-sim = { path = "../colibri-sim" }
+colibri-spotread = { path = "../colibri-spotread" }
 colibri-windows = { path = "../colibri-windows" }
 
 [lints]

@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "colibri-core",
  "colibri-sim",
+ "colibri-spotread",
  "colibri-windows",
 ]
 

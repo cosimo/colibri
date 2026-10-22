@@ -3,7 +3,7 @@
 This guide covers getting a Datacolor Spyder4 (Express, Pro or Elite: same
 hardware) reading through ArgyllCMS, checking how accurate it still is, and
 testing colibri's patch window against it. colibri can't drive the sensor
-itself yet, so Argyll's `spotread` does the measuring for now.
+itself yet, so it runs Argyll's `spotread` once for each reading.
 
 Commands that read the instrument come from Argyll. Their options vary
 between versions, so check `spotread -?` and the
@@ -120,38 +120,65 @@ Windows must show the patches untouched:
 
 ## 7. Test colibri's patch window
 
-In one terminal, open the patch window on the monitor to measure:
+`colibri check` opens the patch window, reads seven patches through
+`spotread` and prints the readings. Nothing needs typing during the run.
+
+First tell it the display type letter from step 3, if it isn't `e`. In
+PowerShell:
 
 ```
-cargo run --release -p colibri-cli -- patch --monitor 0 255 255 255
+$env:COLIBRI_SPOTREAD_ARGS = "-y e"
 ```
 
-A black screen with a white square in the middle appears; the mouse cursor
-is hidden over it. Put the sensor in the middle of the square. The terminal
-waits for colours: type `R G B` (0 to 255) and Enter to change the patch, and
-an empty line or `q` to close. `--size 0.8` makes the square bigger.
+or in cmd, `set COLIBRI_SPOTREAD_ARGS=-y e`. If `spotread` isn't on `PATH`,
+set `COLIBRI_SPOTREAD` to the full path of `spotread.exe`. Then:
 
-In a second terminal, run `spotread -x -y <letter>` and take a reading after
-each colour change. Measure these patches:
+```
+cargo run --release -p colibri-cli -- check --monitor 0
+```
 
-| Type into colibri | What a working setup shows |
-|---|---|
-| `255 255 255` | the brightest reading; its x, y is the monitor's native white |
-| `0 0 0` | a very low Y, around 0.1–0.5 cd/m² on a typical LCD |
-| `128 128 128` | Y roughly 20% of white, with x, y close to white's |
-| `255 0 0` | x well above 0.6 |
-| `0 255 0` | y well above 0.6 |
-| `0 0 255` | x around 0.15, y below 0.1 |
-| `255 255 255` again | the same as the first white, within about 1% |
+It looks for the Spyder in `spotread -?` first. Then a black screen with a
+white square in the middle covers the monitor. Put the sensor flat in the
+middle of the square, and press Space or click anywhere on the black. The
+square goes through white, black, gray, red, green, blue and white again,
+one reading each, with the progress in the bottom-left corner. Esc cancels.
+Each reading takes a few seconds, since `spotread` opens the sensor every
+time.
 
-Two quick checks on the readings:
+The window closes at the end, and the terminal shows something like this
+(made-up numbers):
 
-- **Additivity:** the Y values of red, green and blue should add up to within
-  a few percent of white's Y. A much bigger gap means the panel's channels
-  interact, or Windows is still transforming the patches (go back to
-  step 6).
-- **Repeatability:** the two white readings should agree. If they drift,
-  give the monitor longer to warm up.
+```
+patch    R   G   B   Y cd/m² of white       x       y
+white  255 255 255   120.312   100.0%  0.3135  0.3301
+black    0   0   0     0.214     0.2%  0.2690  0.2810
+gray   128 128 128    25.871    21.5%  0.3131  0.3298
+red    255   0   0    26.402    21.9%  0.6402  0.3301
+green    0 255   0    80.113    66.6%  0.3005  0.6003
+blue     0   0 255    13.987    11.6%  0.1503  0.0601
+white  255 255 255   120.104    99.8%  0.3134  0.3300
+additivity error 0.31%: red + green + blue against white
+white drift: Y -0.17%, xy 0.0001
+```
+
+What a working setup shows:
+
+- Black: a very low Y, around 0.1–0.5 cd/m² on a typical LCD.
+- Gray: Y roughly 20% of white, with x, y close to white's.
+- Red: x well above 0.6. Green: y well above 0.6. Blue: x around 0.15,
+  y below 0.1.
+- Additivity error: within a few percent. A much bigger one means the
+  panel's channels interact, or Windows is still transforming the patches
+  (go back to step 6).
+- White drift: within about 1% in Y. If it drifts more, give the monitor
+  longer to warm up.
+
+`check` warns when the monitor has a gamma ramp loaded. Its readings are
+then not the panel's own, so reset the ramp as in step 6 and run it again.
+
+`colibri patch --monitor 0 R G B` still shows a single patch, for spot
+checks with `spotread` by hand. It needs a second monitor for the
+terminals, since the patch window covers the one it is on.
 
 ## 8. What to report back
 
@@ -161,11 +188,11 @@ Please paste:
    display types).
 2. The display type you chose, and the D65 check from step 4 with the
    reference screen used.
-3. The readings from step 7: Y, x, y for each patch.
+3. The output of `colibri check` from step 7.
 4. The output of `colibri displays` and `colibri gamma show`.
 5. Anything that misbehaved: the patch window not appearing or not covering
-   the monitor, wrong colours, the terminal hanging after typing a colour,
-   or error messages.
+   the monitor, wrong colours, Space or the click not starting the run, a
+   reading timing out, or error messages.
 
 From that, colibri's Spyder4 backend gets its trust level and display-type
 correction, and the patch window gets its first real test.
