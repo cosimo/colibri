@@ -233,3 +233,23 @@ fn refinement_corrects_channel_interaction() {
     assert!(open_loop > INVISIBLE, "open loop {open_loop}");
     assert!(refined < 0.2, "refined {refined}");
 }
+
+#[test]
+fn eight_bit_patch_window_is_enough() {
+    // Real patch windows often show only 256 levels. Calibration measures the
+    // levels actually shown, so it loses almost nothing.
+    let run = |bits| {
+        let mut rig = SimRig::new(
+            SimDisplay::wide_gamut(),
+            SimSensor::colorimeter(12).with_noise(0.0, 0.0),
+        );
+        rig.patch_bits = bits;
+        let rig = calibrated(rig, NATIVE_22);
+        worst_delta_e(&rig.display, TargetCurve::Gamma(2.2))
+    };
+    let (continuous, eight) = (run(None), run(Some(8)));
+    assert!(
+        eight < continuous + 0.05,
+        "8-bit {eight} vs continuous {continuous}"
+    );
+}

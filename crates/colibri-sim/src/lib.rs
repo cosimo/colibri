@@ -21,6 +21,8 @@ pub struct SimRig {
     pub sensor: SimSensor,
     /// Number of patches measured so far.
     pub measurements: usize,
+    /// Bits per channel of the simulated patch window; `None` shows any value.
+    pub patch_bits: Option<u32>,
 }
 
 impl SimRig {
@@ -29,6 +31,7 @@ impl SimRig {
             display,
             sensor,
             measurements: 0,
+            patch_bits: None,
         }
     }
 }
@@ -36,11 +39,19 @@ impl SimRig {
 impl Rig for SimRig {
     fn measure(&mut self, patch: Rgb) -> Result<Vec3, MeasureError> {
         self.measurements += 1;
-        Ok(self.sensor.read(&self.display.spectrum(patch)))
+        let shown = self.quantize(patch);
+        Ok(self.sensor.read(&self.display.spectrum(shown)))
     }
 
     fn trust(&self) -> Trust {
         self.sensor.trust
+    }
+
+    fn quantize(&self, patch: Rgb) -> Rgb {
+        match self.patch_bits {
+            Some(bits) => colibri_core::rig::quantize(patch, bits),
+            None => patch,
+        }
     }
 }
 

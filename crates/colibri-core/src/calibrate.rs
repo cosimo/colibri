@@ -210,8 +210,12 @@ pub fn characterize<R: Rig + ?Sized>(
     let mut white = black;
     for i in 1..steps {
         let s = i as f64 / (steps - 1) as f64;
-        let reading = measure(rig, [s, s, s])?;
-        drives.push(s);
+        let shown = rig.quantize([s, s, s]);
+        if shown[0] <= drives[drives.len() - 1] {
+            continue; // more steps than the display has levels
+        }
+        let reading = measure(rig, shown)?;
+        drives.push(shown[0]);
         linear.push(to_linear * sub(reading, black));
         white = reading;
     }
@@ -329,15 +333,16 @@ pub fn refine<R: Rig + ?Sized>(
     for i in 1..steps {
         let v = i as f64 / (steps - 1) as f64;
         let drive = curves.apply([v, v, v]);
-        let linear = to_linear * sub(measure_mean(rig, drive, options.repeats)?, ch.black);
+        let shown = rig.quantize(drive);
+        let linear = to_linear * sub(measure_mean(rig, shown, options.repeats)?, ch.black);
         let level = target.curve.eval(v);
         for c in 0..3 {
             let curve = &ch.curves[c];
-            let wanted = curve.eval(drive[c]) + amounts[c] * level - linear[c];
+            let wanted = curve.eval(shown[c]) + amounts[c] * level - linear[c];
             deltas[c][i - 1] = curve.inverse(wanted) - drive[c];
             // A reading error σ moves the drive correction by σ / slope.
             let h = 1e-3;
-            let slope = (curve.eval(drive[c] + h) - curve.eval(drive[c] - h)) / (2.0 * h);
+            let slope = (curve.eval(shown[c] + h) - curve.eval(shown[c] - h)) / (2.0 * h);
             let var = ch.noise[c].variance(amounts[c] * level) / slope.max(1e-6).powi(2);
             weights[c][i - 1] = 1.0 / var.max(1e-18);
         }

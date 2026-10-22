@@ -45,4 +45,98 @@ pub trait Rig {
     fn measure(&mut self, patch: Rgb) -> Result<Vec3, MeasureError>;
 
     fn trust(&self) -> Trust;
+
+    /// The drive values actually shown for `patch`, for displays that can
+    /// only show a limited number of levels (an 8-bit patch window shows
+    /// multiples of 1/255). Calibration uses these as the true drive values.
+    fn quantize(&self, patch: Rgb) -> Rgb {
+        patch
+    }
+}
+
+/// A measuring instrument, independent of how patches get on screen.
+pub trait Instrument {
+    /// Take one reading of whatever the instrument is pointed at.
+    fn read(&mut self) -> Result<Vec3, MeasureError>;
+
+    fn trust(&self) -> Trust;
+}
+
+/// Something that can fill the measured area with one colour.
+pub trait PatchDisplay {
+    /// Show `patch` and return once it is on screen.
+    fn show(&mut self, patch: Rgb) -> Result<(), MeasureError>;
+
+    /// Bits per channel of the patches shown.
+    fn bits(&self) -> u32;
+}
+
+/// A [`PatchDisplay`] and an [`Instrument`] used together as a [`Rig`].
+pub struct InstrumentRig<D, I> {
+    pub display: D,
+    pub instrument: I,
+    /// Wait after changing the patch, for the panel to settle.
+    pub settle: std::time::Duration,
+}
+
+impl<D: PatchDisplay, I: Instrument> Rig for InstrumentRig<D, I> {
+    fn measure(&mut self, patch: Rgb) -> Result<Vec3, MeasureError> {
+        self.display.show(self.quantize(patch))?;
+        std::thread::sleep(self.settle);
+        self.instrument.read()
+    }
+
+    fn trust(&self) -> Trust {
+        self.instrument.trust()
+    }
+
+    fn quantize(&self, patch: Rgb) -> Rgb {
+        quantize(patch, self.display.bits())
+    }
+}
+
+/// Round each channel of `patch` to the nearest level of a `bits`-bit display.
+pub fn quantize(patch: Rgb, bits: u32) -> Rgb {
+    let max = ((1u64 << bits.clamp(1, 32)) - 1) as f64;
+    patch.map(|v| (v.clamp(0.0, 1.0) * max).round() / max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Recorder(Vec<Rgb>);
+
+    impl PatchDisplay for Recorder {
+        fn show(&mut self, patch: Rgb) -> Result<(), MeasureError> {
+            self.0.push(patch);
+            Ok(())
+        }
+        fn bits(&self) -> u32 {
+            8
+        }
+    }
+
+    struct Constant;
+
+    impl Instrument for Constant {
+        fn read(&mut self) -> Result<Vec3, MeasureError> {
+            Ok([1.0, 2.0, 3.0])
+        }
+        fn trust(&self) -> Trust {
+            Trust::Relative
+        }
+    }
+
+    #[test]
+    fn instrument_rig_shows_quantized_patches() {
+        let mut rig = InstrumentRig {
+            display: Recorder(Vec::new()),
+            instrument: Constant,
+            settle: std::time::Duration::ZERO,
+        };
+        assert_eq!(rig.measure([0.5, 0.0, 1.0]).unwrap(), [1.0, 2.0, 3.0]);
+        assert_eq!(rig.display.0, vec![[128.0 / 255.0, 0.0, 1.0]]);
+        assert_eq!(rig.trust(), Trust::Relative);
+    }
 }

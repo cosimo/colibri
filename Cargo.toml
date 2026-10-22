@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/colibri-core", "crates/colibri-sim"]
+members = ["crates/colibri-core", "crates/colibri-sim", "crates/colibri-windows", "crates/colibri-cli"]
 
 [workspace.package]
 version = "0.1.0"

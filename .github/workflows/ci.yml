@@ -20,3 +20,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
       - run: cargo run -p colibri-sim --example compare_sensors
+      - run: cargo run -p colibri-cli -- simulate --out simulated.icc
+      - name: List monitors (Windows API smoke test)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: cargo run -p colibri-cli -- displays

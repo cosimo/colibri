@@ -1,0 +1,20 @@
+[package]
+name = "colibri-cli"
+description = "colibri command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "colibri"
+path = "src/main.rs"
+
+[dependencies]
+colibri-core = { path = "../colibri-core" }
+colibri-sim = { path = "../colibri-sim" }
+colibri-windows = { path = "../colibri-windows" }
+
+[lints]
+workspace = true

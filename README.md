@@ -18,7 +18,25 @@ cargo run -p colibri-sim --example compare_sensors
 | Crate | What it holds |
 |---|---|
 | `colibri-core` | Colorimetry (XYZ, Lab, ΔE2000, Bradford, RGB matrices), noise-aware tone curve fitting, the `Rig` instrument trait, calibration with optional closed-loop refinement, and an ICC v4 profile writer with `vcgt` and Microsoft's `MHC2` tag. No dependencies. |
+| `colibri-windows` | Windows integration: monitor list, a full-screen 8-bit patch window, GPU gamma ramp read/reset. |
+| `colibri-cli` | The `colibri` command: `displays`, `patch`, `gamma`, `simulate`. |
 | `colibri-sim` | Spectral display model (with ripple and channel interaction) and simulated colorimeter, aged colorimeter and RAW phone camera, an emulation of Windows' MHC2 pipeline, and a ground-truth checker. |
+
+### Trying it on Windows
+
+There is no instrument backend yet, but the patch window can already be
+checked against ArgyllCMS's own `spotread`:
+
+```
+cargo run --release -p colibri-cli -- displays
+cargo run --release -p colibri-cli -- gamma reset --monitor 0
+cargo run --release -p colibri-cli -- patch --monitor 0 255 255 255
+```
+
+Put the sensor on the patch, run `spotread` in another terminal, and type
+`R G B` values (0-255) into colibri to change the patch. Turn off Auto Color
+Management and any MHC2 profile for that display first, so Windows shows the
+patches untouched.
 
 Things the simulator has shown so far:
 

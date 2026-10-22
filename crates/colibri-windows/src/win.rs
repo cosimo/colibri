@@ -1,0 +1,334 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use colibri_core::rig::{MeasureError, PatchDisplay, Rgb};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, CreateDCW, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, EnumDisplayMonitors,
+    FillRect, GetMonitorInfoW, InvalidateRect, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    PAINTSTRUCT,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
+    GetWindowLongPtrW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, MONITORINFOF_PRIMARY, MSG, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+use crate::{Error, GammaRamp, Monitor};
+
+const WM_SHOW_PATCH: u32 = WM_APP + 1;
+const VK_ESCAPE: usize = 0x1B;
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn last_error(call: &'static str) -> Error {
+    Error::Os(call, unsafe { GetLastError() })
+}
+
+/// All monitors attached to the desktop.
+pub fn monitors() -> Result<Vec<Monitor>, Error> {
+    unsafe extern "system" fn collect(
+        handle: HMONITOR,
+        _dc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> windows_sys::core::BOOL {
+        let list = &mut *(data as *mut Vec<Monitor>);
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) != 0 {
+            let r = info.monitorInfo.rcMonitor;
+            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(32);
+            list.push(Monitor {
+                index: list.len(),
+                device: String::from_utf16_lossy(&info.szDevice[..len]),
+                left: r.left,
+                top: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            });
+        }
+        1
+    }
+
+    let mut list: Vec<Monitor> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &mut list as *mut Vec<Monitor> as LPARAM,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("EnumDisplayMonitors"));
+    }
+    Ok(list)
+}
+
+fn with_monitor_dc<T>(
+    monitor: &Monitor,
+    f: impl FnOnce(HDC) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let device = wide(&monitor.device);
+    let dc = unsafe {
+        CreateDCW(
+            device.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if dc.is_null() {
+        return Err(last_error("CreateDCW"));
+    }
+    let result = f(dc);
+    unsafe { DeleteDC(dc) };
+    result
+}
+
+/// The gamma ramp currently loaded for `monitor`.
+pub fn gamma_ramp(monitor: &Monitor) -> Result<GammaRamp, Error> {
+    with_monitor_dc(monitor, |dc| {
+        let mut ramp: GammaRamp = [[0; 256]; 3];
+        if unsafe { GetDeviceGammaRamp(dc, ramp.as_mut_ptr() as *mut _) } == 0 {
+            return Err(last_error("GetDeviceGammaRamp"));
+        }
+        Ok(ramp)
+    })
+}
+
+/// Load a gamma ramp for `monitor`. Windows refuses ramps far from identity
+/// unless the system allows a wider range.
+pub fn set_gamma_ramp(monitor: &Monitor, ramp: &GammaRamp) -> Result<(), Error> {
+    with_monitor_dc(monitor, |dc| {
+        if unsafe { SetDeviceGammaRamp(dc, ramp.as_ptr() as *const _) } == 0 {
+            return Err(last_error("SetDeviceGammaRamp"));
+        }
+        Ok(())
+    })
+}
+
+/// State shared between the window procedure and its owner.
+struct WindowState {
+    color: u32,
+    /// Side of the centred patch as a fraction of the monitor's shorter side.
+    size: f64,
+    awaiting_paint: bool,
+    painted: Sender<()>,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// A borderless, topmost window covering one monitor: black, with a centred
+/// square patch. Patches are 8-bit and drawn with GDI, which Windows does
+/// not colour-manage (Auto Color Management aside).
+pub struct PatchWindow {
+    hwnd: usize,
+    thread: Option<JoinHandle<()>>,
+    painted: Receiver<()>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PatchWindow {
+    /// Open the window on `monitor`. `size` is the patch side as a fraction
+    /// of the monitor's shorter side (1.0 fills the height).
+    pub fn open(monitor: &Monitor, size: f64) -> Result<PatchWindow, Error> {
+        let (painted_tx, painted_rx) = channel();
+        let (hwnd_tx, hwnd_rx) = channel::<Result<usize, Error>>();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let state = WindowState {
+            color: 0,
+            size: size.clamp(0.05, 1.0),
+            awaiting_paint: false,
+            painted: painted_tx,
+            cancelled: cancelled.clone(),
+        };
+        let monitor = monitor.clone();
+        let thread = std::thread::spawn(move || unsafe { run_window(monitor, state, hwnd_tx) });
+        let hwnd = hwnd_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| Error::Timeout)??;
+        Ok(PatchWindow {
+            hwnd,
+            thread: Some(thread),
+            painted: painted_rx,
+            cancelled,
+        })
+    }
+
+    /// Show an 8-bit colour and wait until it has been composited.
+    pub fn show_rgb8(&mut self, rgb: [u8; 3]) -> Result<(), Error> {
+        let color = rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16;
+        while self.painted.try_recv().is_ok() {}
+        let ok = unsafe { PostMessageW(self.hwnd as HWND, WM_SHOW_PATCH, color as WPARAM, 0) };
+        if ok == 0 {
+            return Err(last_error("PostMessageW"));
+        }
+        self.painted
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| Error::Timeout)
+    }
+
+    /// True once the user has pressed Escape in the window.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+impl PatchDisplay for PatchWindow {
+    fn show(&mut self, patch: Rgb) -> Result<(), MeasureError> {
+        if self.cancelled() {
+            return Err(MeasureError::Cancelled);
+        }
+        let rgb = patch.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+        self.show_rgb8(rgb)
+            .map_err(|e| MeasureError::Instrument(e.to_string()))
+    }
+
+    fn bits(&self) -> u32 {
+        8
+    }
+}
+
+impl Drop for PatchWindow {
+    fn drop(&mut self) {
+        unsafe { PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0) };
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+unsafe fn run_window(monitor: Monitor, state: WindowState, hwnd_tx: Sender<Result<usize, Error>>) {
+    let class = wide("colibri-patch-window");
+    let instance = GetModuleHandleW(std::ptr::null());
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(window_proc),
+        hInstance: instance,
+        lpszClassName: class.as_ptr(),
+        ..std::mem::zeroed()
+    };
+    if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
+        let _ = hwnd_tx.send(Err(last_error("RegisterClassW")));
+        return;
+    }
+    let title = wide("colibri patch");
+    let hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        class.as_ptr(),
+        title.as_ptr(),
+        WS_POPUP,
+        monitor.left,
+        monitor.top,
+        monitor.width,
+        monitor.height,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        instance,
+        std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        let _ = hwnd_tx.send(Err(last_error("CreateWindowExW")));
+        return;
+    }
+    let state = Box::into_raw(Box::new(state));
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    let _ = hwnd_tx.send(Ok(hwnd as usize));
+
+    let mut msg: MSG = std::mem::zeroed();
+    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    drop(Box::from_raw(state));
+}
+
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+    if state.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let state = &mut *state;
+    match msg {
+        WM_SHOW_PATCH => {
+            state.color = wparam as u32;
+            state.awaiting_paint = true;
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            let black = CreateSolidBrush(0);
+            FillRect(dc, &client, black);
+            DeleteObject(black);
+            let (w, h) = (client.right - client.left, client.bottom - client.top);
+            let side = (w.min(h) as f64 * state.size).round() as i32;
+            let patch = RECT {
+                left: (w - side) / 2,
+                top: (h - side) / 2,
+                right: (w + side) / 2,
+                bottom: (h + side) / 2,
+            };
+            let brush = CreateSolidBrush(state.color);
+            FillRect(dc, &patch, brush);
+            DeleteObject(brush);
+            EndPaint(hwnd, &ps);
+            if state.awaiting_paint {
+                // Wait for the compositor to present the new frame.
+                DwmFlush();
+                DwmFlush();
+                state.awaiting_paint = false;
+                let _ = state.painted.send(());
+            }
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_SETCURSOR => {
+            SetCursor(std::ptr::null_mut());
+            1
+        }
+        WM_KEYDOWN if wparam == VK_ESCAPE => {
+            state.cancelled.store(true, Ordering::Relaxed);
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
